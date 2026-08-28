@@ -7,7 +7,12 @@ ENV PYTHONUNBUFFERED=1 \
     PORT=8080 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-# System dependencies required by the application
+# ============================================================
+# System dependencies
+# ============================================================
+
+USER root
+
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         poppler-utils \
@@ -24,22 +29,33 @@ RUN apt-get update && \
         gnupg && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
-COPY requirements.txt .
+# ============================================================
+# Python dependencies
+# ============================================================
+
+COPY requirements.txt /app/requirements.txt
 
 RUN python -m pip install --no-cache-dir --upgrade pip && \
-    python -m pip install --no-cache-dir -r requirements.txt
+    python -m pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy application
-COPY . .
+# ============================================================
+# Application
+# ============================================================
 
-# Create a non-root user.
-# UID 1000 is already occupied in the Playwright image,
-# therefore use UID 1001.
-RUN useradd -m -u 1001 -s /bin/bash appuser && \
-    chown -R appuser:appuser /app
+COPY . /app
 
-USER appuser
+# Give the existing Playwright user access to the application.
+RUN chown -R pwuser:pwuser /app
+
+# ============================================================
+# Run as Playwright's existing non-root user
+# ============================================================
+
+USER pwuser
+
+# ============================================================
+# Cloud Run
+# ============================================================
 
 EXPOSE 8080
 
