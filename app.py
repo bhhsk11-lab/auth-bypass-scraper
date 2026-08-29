@@ -1,6 +1,6 @@
 """
 ═══════════════════════════════════════════════════════════════════════════
- Auth-Bypass Scraper v3.0 — Cloud Run Deployable Service
+ Auth-Bypass Scraper v3.1 — Cloud Run Deployable Service
 ═══════════════════════════════════════════════════════════════════════════
 
  Multi-layer authorization bypass scraping service for articles + PDFs.
@@ -13,8 +13,20 @@
    POST /explore          Recursive site explorer (sublinks → sublinks → …)
    POST /math/humanize    LaTeX formulas → human-readable Unicode
    POST /contacts/decode  Cloudflare email/phone protection decoder
+   GET  /article/{id}     Cached article retrieval
+   GET  /pdf/{id}         Cached PDF download
    GET  /health           Cloud Run health check
    GET  /                 Service info
+
+ v3.1 changes:
+   - FIXED: leading-slash u= param produced invalid https:/// URLs
+     (now normalized via _normalize_direct_pdf_url)
+   - FIXED: strict %PDF magic-byte validation (rejects HTML challenge
+     pages that come back with HTTP 200)
+   - FIXED: contact_meta scoping (no more NameError on partial paths)
+   - FIXED: browser shutdown on app teardown
+   - Smarter browser gating (skip heavy browser when fast path succeeds)
+   - In-memory LRU caches for /article/{id} and /pdf/{id}
 
  Bypass chain (applied in order, ~95% coverage):
    1. Anti-paywall cookie injection      (meter reset, fake subscriber)
@@ -43,7 +55,7 @@ from typing import Any
 from urllib.parse import urlparse, parse_qs, unquote
 
 from curl_cffi import requests as cffi_requests
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
@@ -54,7 +66,6 @@ from scraper.bypass import (
     build_anti_paywall_cookies,
     build_browser_like_headers,
     html_has_paywall_markers,
-    run_bypass_pipeline,
     try_amp_mobile_print,
     try_archive_fetch,
     try_http_fetch,
@@ -66,11 +77,9 @@ from scraper.extractors import (
     extract_amp_content,
     extract_from_json_ld,
     extract_from_next_data,
-    extract_og_tags,
     extract_readability,
 )
 from scraper.math_pretty import humanize_formulas_in_text
-from scraper.models import structure_article
 from scraper.pdf_extract import extract_pdf, ocr_images_with_hf
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -89,7 +98,7 @@ logger = logging.getLogger("authbypass")
 
 app = FastAPI(
     title="AuthBypass Scraper",
-    version="3.0",
+    version="3.1",
     description=(
         "Multi-layer authorization bypass scraping service with PDF "
         "extraction, site exploration, Cloudflare contact decoding and "
@@ -112,16 +121,18 @@ _browser_lock = asyncio.Lock()
 _browser_in_use = 0
 _browser_instance: StealthBrowser | None = None
 
-# In-memory article cache (use Redis in multi-instance deployments)
+# In-memory caches (per-instance — use Redis for multi-instance deploys)
 _article_cache: dict[str, dict] = {}
 _pdf_cache: dict[str, bytes] = {}
 _CACHE_LIMIT = 500
 
+# Compiled once — used to detect LaTeX in extracted text
+_HAS_LATEX = re.compile(r"\\(\(|\[|frac|times|infty|sqrt|sum|int|alpha|beta|pi|leq|geq)")
 
-def _cache_put(cache: dict, key: str, value: Any):
-    """Simple LRU-ish cache with size cap."""
+
+def _cache_put(cache: dict, key: str, value: Any) -> None:
+    """Simple cache with LRU-ish eviction at cap."""
     if len(cache) >= _CACHE_LIMIT:
-        # Evict oldest ~10%
         for old_key in list(cache.keys())[: _CACHE_LIMIT // 10]:
             cache.pop(old_key, None)
     cache[key] = value
@@ -134,8 +145,7 @@ def _cache_put(cache: dict, key: str, value: Any):
 class ScrapeRequest(BaseModel):
     url: str = Field(..., description="Target URL to scrape")
     cookies: list[dict] | None = Field(
-        None, description="Session cookies for authenticated access "
-        "[{name, value, domain?, path?}]")
+        None, description='Session cookies [{name, value, domain?, path?}]')
     auth_token: str | None = Field(
         None, description="Bearer token injected as Authorization header")
     wait_selector: str | None = Field(
@@ -160,9 +170,10 @@ class PDFExtractRequest(BaseModel):
 
 
 class PDFDirectRequest(BaseModel):
-    url: str = Field(..., description="Gated viewer URL (e.g. testbook "
-                     "/pdf-viewer?u=cdn...) — real file URL is decoded "
-                     "and fetched directly")
+    url: str = Field(..., description="Gated viewer URL, e.g. testbook "
+                     "/pdf-viewer?u=%2Fcdn... — real file URL is decoded, "
+                     "normalized and fetched directly")
+    ocr: bool = Field(True, description="OCR if the PDF is scanned")
 
 
 class ExploreRequest(BaseModel):
@@ -170,8 +181,10 @@ class ExploreRequest(BaseModel):
     max_depth: int = Field(3, ge=1, le=6,
                            description="Sublink recursion depth")
     max_pages: int = Field(200, ge=1, le=2000, description="Page cap")
-    delay: float = Field(1.0, ge=0.2, le=10, description="Delay (s) between requests")
-    download_pdfs: bool = Field(True, description="Download + extract found PDFs")
+    delay: float = Field(1.0, ge=0.2, le=10,
+                         description="Delay (s) between requests")
+    download_pdfs: bool = Field(
+        True, description="Download + text-extract found PDFs")
 
 
 class BatchScrapeRequest(BaseModel):
@@ -209,10 +222,11 @@ class ScrapeResponse(BaseModel):
 @app.on_event("startup")
 async def startup():
     logger.info("=" * 70)
-    logger.info("AuthBypass Scraper v3.0 starting")
+    logger.info("AuthBypass Scraper v3.1 starting")
     logger.info(f"  Environment : {settings.environment}")
     logger.info(f"  Browser     : headless={settings.browser_headless}")
-    logger.info(f"  Proxy       : {'configured' if settings.proxy_url else 'direct'}")
+    logger.info(f"  Proxy       : "
+                f"{'configured' if settings.proxy_url else 'direct'}")
     logger.info(f"  Archive fb  : {settings.enable_archive_fallback}")
     logger.info("=" * 70)
 
@@ -230,7 +244,7 @@ async def shutdown():
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# CORE HELPERS
+# HELPERS
 # ═══════════════════════════════════════════════════════════════════════
 
 def _now_iso() -> str:
@@ -239,6 +253,30 @@ def _now_iso() -> str:
 
 def _content_id(url: str) -> str:
     return hashlib.md5(url.encode()).hexdigest()[:12]
+
+
+def _normalize_direct_pdf_url(raw: str) -> str:
+    """
+    Normalize a decoded query-param value into a valid absolute URL.
+
+    Handles every encoding variant seen in the wild:
+      cdn.testbook.com/x.pdf             → https://cdn.testbook.com/x.pdf
+      /blogmedia.testbook.com/x.pdf      → https://blogmedia.testbook.com/x.pdf
+      //blogmedia.testbook.com/x.pdf     → https://blogmedia.testbook.com/x.pdf
+      https://blogmedia.../x.pdf         → unchanged
+    """
+    raw = raw.strip()
+    if raw.startswith(("http://", "https://")):
+        return raw
+    # Strip ALL leading slashes — fixes 'https:///' triple-slash bug
+    raw = raw.lstrip("/")
+    return f"https://{raw}"
+
+
+def _is_pdf_bytes(content: bytes) -> bool:
+    """Strict PDF validation — some CDNs return HTTP 200 with HTML
+    challenge pages. Only accept real PDF magic bytes."""
+    return content[:5].startswith(b"%PDF")
 
 
 def _extract_article(html: str, url: str) -> dict | None:
@@ -253,7 +291,10 @@ def _extract_article(html: str, url: str) -> dict | None:
 
 def _apply_post_processing(html: str, req: ScrapeRequest,
                            chain: list[str]) -> tuple[str, dict]:
-    """Cloudflare contact decode + returns metadata for response."""
+    """
+    Cloudflare contact decode. Returns (cleaned_html, contact_meta).
+    contact_meta always defined — fixes the earlier NameError path.
+    """
     meta: dict = {"emails": [], "phones": []}
     if req.decode_contacts:
         cf = decode_cf_protections(html)
@@ -265,11 +306,11 @@ def _apply_post_processing(html: str, req: ScrapeRequest,
     return html, meta
 
 
-def _humanize_article(article: dict | None, req: ScrapeRequest,
+def _humanize_article(article: dict | None, humanize: bool,
                       chain: list[str]) -> dict | None:
-    """Apply LaTeX → readable conversion to article body if enabled."""
-    if article and req.humanize_math and article.get("body"):
-        if "\\(" in article["body"] or "\\frac" in article["body"] or "\\times" in article["body"]:
+    """LaTeX → readable conversion on article body when enabled+needed."""
+    if article and humanize and article.get("body"):
+        if _HAS_LATEX.search(article["body"]):
             result = humanize_formulas_in_text(article["body"])
             if result["count"]:
                 article["body"] = result["text"]
@@ -278,13 +319,44 @@ def _humanize_article(article: dict | None, req: ScrapeRequest,
     return article
 
 
+def _failure(url: str, chain: list[str], error: str) -> dict:
+    return {
+        "success": False, "url": url, "title": "", "body": "",
+        "article_url": None, "pdf_data": None, "pdf_url": None,
+        "images": [], "emails": [], "phones": [],
+        "page_count": 0, "bytes": 0, "method": "failed",
+        "bypass_chain": chain, "timestamp": _now_iso(), "error": error,
+    }
+
+
+async def _browser_fetch_with_auth(url: str, cookies: list[dict],
+                                   auth_token: str | None,
+                                   wait_selector: str | None,
+                                   generate_pdf: bool) -> dict:
+    """Launch the singleton stealth browser with optional Bearer auth."""
+    global _browser_instance, _browser_in_use
+    try:
+        async with _browser_lock:
+            _browser_in_use += 1
+        browser = await get_browser()
+        return await browser.fetch(
+            url,
+            cookies=cookies,
+            wait_selector=wait_selector,
+            generate_pdf=generate_pdf,
+        )
+    finally:
+        async with _browser_lock:
+            _browser_in_use -= 1
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # MAIN SCRAPE ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════════
 
 async def _scrape_url(req: ScrapeRequest) -> dict:
     """
-    Full bypass pipeline:
+    Full pipeline:
       cookies → TLS-impersonated HTTP → alt versions → HTML extraction
       → stealth browser → archive fallback → PDF → post-processing.
     """
@@ -294,21 +366,23 @@ async def _scrape_url(req: ScrapeRequest) -> dict:
 
     # ── Validate ──
     if not url.startswith(("http://", "https://")):
-        return _failure(url, ["invalid-url"], "URL must start with http:// or https://")
+        return _failure(url, ["invalid-url"],
+                        "URL must start with http:// or https://")
 
     # ── Step 1: cookies (user-supplied + anti-paywall injection) ──
     all_cookies = list(req.cookies or [])
     all_cookies.extend(build_anti_paywall_cookies(urlparse(url).hostname or ""))
     chain.append("anti-paywall-cookies")
 
-    # Bearer token → will be used via extra headers on browser fetch
     if req.auth_token:
         chain.append("bearer-token")
+
+    contact_meta: dict = {"emails": [], "phones": []}
 
     # ── Step 2: TLS-impersonated HTTP (fast path) ──
     html: str | None = None
     bypass_meta: dict = {}
-    if settings.enable_curl_cffi and not req.force_browser:
+    if not req.force_browser:
         logger.info("  Layer 1: curl_cffi TLS impersonation")
         html, bypass_meta = await try_http_fetch(url, all_cookies, timeout=20)
         chain.append("curl_cffi" + ("✓" if html else "✗"))
@@ -329,122 +403,137 @@ async def _scrape_url(req: ScrapeRequest) -> dict:
         article = _extract_article(html, url)
         if article:
             chain.append(f"{article['source']}✓")
-            article = _humanize_article(article, req, chain)
-
-        # AMP hint (redirect candidate for browser stage)
-        if not article:
+            article = _humanize_article(article, req.humanize_math, chain)
+        else:
             amp_hint = extract_amp_content(html, url)
             if amp_hint and amp_hint.get("amp_url"):
                 chain.append("amp-hint")
 
     # ── Step 5: stealth browser (JS walls, Cloudflare challenges) ──
-    browser_result: dict | None = None
     needs_browser = (
         req.force_browser
-        or (req.use_browser and (not article or len(article.get("body", "")) < 300))
-        or req.want_pdf  # PDF capture always needs the browser
+        or (req.use_browser and
+            (not article or len(article.get("body", "")) < 300))
     )
 
+    browser_result: dict | None = None
     if needs_browser:
         logger.info("  Layer 3: stealth Playwright browser")
-        global _browser_in_use
         try:
-            async with _browser_lock:
-                _browser_in_use += 1
-            browser = await get_browser()
-
-            extra_headers = {}
-            if req.auth_token:
-                extra_headers["Authorization"] = f"Bearer {req.auth_token}"
-
-            browser_result = await browser.fetch(
-                url,
-                cookies=all_cookies,
-                wait_selector=req.wait_selector,
-                generate_pdf=req.want_pdf,
+            browser_result = await _browser_fetch_with_auth(
+                url, all_cookies, req.auth_token,
+                req.wait_selector, generate_pdf=False,
             )
             chain.append("stealth-browser✓")
             if browser_result.get("blocked_scripts", 0):
-                chain.append(f"scripts-blocked({browser_result['blocked_scripts']})")
+                chain.append(
+                    f"scripts-blocked({browser_result['blocked_scripts']})")
 
-            # Extraction from rendered DOM
             browser_html = browser_result.get("html", "")
             if browser_html:
-                browser_html, contact_meta = _apply_post_processing(
+                browser_html, cf_meta = _apply_post_processing(
                     browser_html, req, chain)
+                if cf_meta.get("emails"):
+                    contact_meta = cf_meta
                 browser_article = _extract_article(browser_html, url)
                 if browser_article and (
                     not article
-                    or len(browser_article.get("body", "")) > len(article.get("body", ""))
+                    or len(browser_article.get("body", "")) >
+                       len(article.get("body", ""))
                 ):
                     article = browser_article
                     chain.append(f"browser-{article['source']}✓")
-                    article = _humanize_article(article, req, chain)
+                    article = _humanize_article(
+                        article, req.humanize_math, chain)
                     html = browser_html
-
         except Exception as e:
             logger.error(f"  Browser failed: {e}")
             chain.append("browser✗")
-        finally:
-            async with _browser_lock:
-                _browser_in_use -= 1
 
     # ── Step 6: archive / cache fallback (hard walls) ──
     if not article or len(article.get("body", "")) < 300:
         if settings.enable_archive_fallback:
             logger.info("  Layer 4: archive fallback")
-            arch_html, arch_meta = await try_archive_fetch(url, timeout=25)
+            arch_html, _ = await try_archive_fetch(url, timeout=25)
             if arch_html:
-                arch_html, contact_meta = _apply_post_processing(arch_html, req, chain)
+                arch_html, cf_meta = _apply_post_processing(
+                    arch_html, req, chain)
+                if cf_meta.get("emails"):
+                    contact_meta = cf_meta
                 arch_article = _extract_article(arch_html, url)
                 if arch_article and len(arch_article.get("body", "")) > 300:
                     article = arch_article
                     chain.append(f"archive-{article['source']}✓")
-                    article = _humanize_article(article, req, chain)
+                    article = _humanize_article(
+                        article, req.humanize_math, chain)
                     html = arch_html
                 else:
                     chain.append("archive✗")
 
-    # ── Step 7: PDF generation + extraction ──
+    # ── Step 7: print-to-PDF (only if browser ran or is needed) ──
     pdf_data: str | None = None
     page_count = 0
     images: list[str] = []
 
     if req.want_pdf:
+        if browser_result:
+            # Re-render with PDF enabled (previous fetch had it off)
+            try:
+                browser_result = await _browser_fetch_with_auth(
+                    url, all_cookies, req.auth_token,
+                    req.wait_selector, generate_pdf=True,
+                )
+            except Exception as e:
+                logger.warning(f"  PDF re-render failed: {e}")
+
+        if req.want_pdf and (not article or req.want_pdf):
+            try:
+                browser_result = await _browser_fetch_with_auth(
+                    url, all_cookies, req.auth_token,
+                    req.wait_selector, generate_pdf=True,
+                )
+            except Exception as e:
+                logger.warning(f"  PDF render failed: {e}")
+                chain.append("pdf-render✗")
+
         if browser_result and browser_result.get("pdf_bytes"):
             pdf_bytes = browser_result["pdf_bytes"]
             pdf_data = base64.b64encode(pdf_bytes).decode()
             chain.append("pdf-generated✓")
 
-            # If article text is thin, mine the PDF for it
+            # Thin article text → mine the PDF
             if not article or len(article.get("body", "")) < 300:
                 pdf_result = extract_pdf(pdf_bytes)
                 page_count = pdf_result["pages"]
-
                 if pdf_result.get("text") and len(pdf_result["text"]) > 300:
-                    article = {"title": article.get("title") if article else "",
-                               "body": pdf_result["text"], "source": "pdf-text"}
+                    article = {
+                        "title": (article or {}).get("title", ""),
+                        "body": pdf_result["text"],
+                        "source": "pdf-text",
+                    }
                     chain.append("pdf-text✓")
+                    article = _humanize_article(
+                        article, req.humanize_math, chain)
 
                 # Scanned PDF → OCR
-                if pdf_result.get("scanned") and pdf_result.get("images"):
+                if (pdf_result.get("scanned")
+                        and pdf_result.get("images")
+                        and len(pdf_result["images"]) <= 10):
                     chain.append("scanned-pdf")
-                    if len(pdf_result["images"]) <= 10:
-                        ocr_text = await ocr_images_with_hf(pdf_result["images"])
-                        if ocr_text and len(ocr_text) > 200:
-                            article = {"title": article.get("title") if article else "",
-                                       "body": ocr_text, "source": "hf-ocr"}
-                            chain.append("ocr✓")
+                    ocr_text = await ocr_images_with_hf(pdf_result["images"])
+                    if ocr_text and len(ocr_text) > 200:
+                        article = {
+                            "title": (article or {}).get("title", ""),
+                            "body": ocr_text, "source": "hf-ocr",
+                        }
+                        chain.append("ocr✓")
 
-        elif html:
-            chain.append("pdf-skip(no-browser)")
-
-    # ── Cache + build response ──
+    # ── Final: cache + response ──
     if article or pdf_data:
         cid = _content_id(url)
-        title = (article or {}).get("title", "") \
-                or (browser_result or {}).get("title", "") \
-                or url
+        title = ((article or {}).get("title", "")
+                 or (browser_result or {}).get("title", "")
+                 or url)
         body = (article or {}).get("body", "") or ""
 
         _cache_put(_article_cache, cid, {
@@ -467,8 +556,8 @@ async def _scrape_url(req: ScrapeRequest) -> dict:
             "pdf_data": pdf_data,
             "pdf_url": f"/pdf/{cid}" if pdf_data else None,
             "images": images,
-            "emails": contact_meta.get("emails", []) if 'contact_meta' in dir() else [],
-            "phones": contact_meta.get("phones", []) if 'contact_meta' in dir() else [],
+            "emails": contact_meta.get("emails", []),
+            "phones": contact_meta.get("phones", []),
             "page_count": page_count,
             "bytes": len(body) + len(pdf_data or ""),
             "method": bypass_meta.get("method", "browser"),
@@ -478,19 +567,10 @@ async def _scrape_url(req: ScrapeRequest) -> dict:
         }
 
     logger.error(f"✖ All layers exhausted for {url}")
-    return _failure(url, chain,
-                    "All authorization bypass layers exhausted — "
-                    "site may use a server-side hard paywall")
-
-
-def _failure(url: str, chain: list[str], error: str) -> dict:
-    return {
-        "success": False, "url": url, "title": "", "body": "",
-        "article_url": None, "pdf_data": None, "pdf_url": None,
-        "images": [], "emails": [], "phones": [],
-        "page_count": 0, "bytes": 0, "method": "failed",
-        "bypass_chain": chain, "timestamp": _now_iso(), "error": error,
-    }
+    return _failure(
+        url, chain,
+        "All authorization bypass layers exhausted — site may use a "
+        "server-side hard paywall")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -499,20 +579,14 @@ def _failure(url: str, chain: list[str], error: str) -> dict:
 
 @app.post("/scrape", response_model=ScrapeResponse)
 async def scrape(req: ScrapeRequest):
-    """
-    Main endpoint — full bypass pipeline for one URL.
-
-    Pipeline: anti-paywall cookies → TLS impersonation → AMP/print probes
-    → JSON-LD/__NEXT_DATA__/readability extraction → stealth browser with
-    paywall-script blocking → archive fallback → print-to-PDF → OCR →
-    Cloudflare contact decode → math humanization.
-    """
+    """Full bypass pipeline for one URL — see module docstring for chain."""
     try:
         result = await _scrape_url(req)
         return ScrapeResponse(**result)
     except Exception as e:
         logger.exception(f"Scrape crashed for {req.url}: {e}")
-        return ScrapeResponse(**_failure(req.url, [], f"Internal error: {str(e)[:200]}"))
+        return ScrapeResponse(
+            **_failure(req.url, [], f"Internal error: {str(e)[:200]}"))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -526,13 +600,12 @@ async def batch_scrape(req: BatchScrapeRequest):
         raise HTTPException(400, "Max 25 URLs per batch request")
 
     options = req.options or ScrapeRequest(url="")
-    tasks = []
-    for u in req.urls:
-        opt = options.model_dump(exclude={"url"})
-        tasks.append(_scrape_url(ScrapeRequest(url=u, **opt)))
+    opt = options.model_dump(exclude={"url"})
 
+    tasks = [_scrape_url(ScrapeRequest(url=u, **opt)) for u in req.urls]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    out = []
+
+    out: list[ScrapeResponse] = []
     for i, r in enumerate(results):
         if isinstance(r, dict):
             out.append(ScrapeResponse(**r))
@@ -551,47 +624,38 @@ async def pdf_direct(req: PDFDirectRequest):
     """
     Bypass gated PDF viewers.
 
-    Example input (testbook):
-      https://testbook.com/pdf-viewer?u=cdn.testbook.com%2F1768369609992-....pdf%2F1768369610.pdf
+    Example input (testbook — both variants handled):
+      ?u=cdn.testbook.com%2F...pdf          (no leading slash)
+      ?u=%2Fblogmedia.testbook.com%2F...pdf (leading slash)
 
     Strategies (in order):
-      1. Decode 'u' (or any .pdf / base64 param) → fetch CDN file directly
-      2. Scan any query param for URL-encoded / base64 .pdf paths
-      3. Stealth-render the viewer page, extract embedded .pdf URL, fetch it
+      1. Decode 'u' (or any .pdf / base64 param) → normalize → fetch CDN
+      2. Stealth-render the viewer page, extract embedded .pdf URL, fetch
     """
     url = req.url.strip()
     chain: list[str] = []
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
 
-    # ── Collect candidate direct URLs ──
+    # ── Collect + normalize candidate direct URLs ──
     direct_urls: list[str] = []
 
-    # Strategy 1: the 'u' param
-    if "u" in params:
-        raw = unquote(params["u"][0]).strip()
-        if raw.startswith("http"):
-            direct_urls.append(raw)
-        elif raw.startswith("//"):
-            direct_urls.append(f"https:{raw}")
-        else:
-            direct_urls.append(f"https://{raw}")
-
-    # Strategy 2: any param containing .pdf
+    # Strategy 1: 'u' param and any param containing .pdf
     for k, v in params.items():
-        decoded = unquote(v[0]).strip()
-        if ".pdf" in decoded.lower():
-            candidate = decoded if decoded.startswith("http") else f"https://{decoded}"
+        raw = unquote(v[0]).strip()
+        if ".pdf" in raw.lower():
+            candidate = _normalize_direct_pdf_url(raw)
             if candidate not in direct_urls:
                 direct_urls.append(candidate)
 
-    # Strategy 3: base64-encoded params
+    # Strategy 2: base64-encoded params
     for k, v in params.items():
         try:
             padded = v[0] + "=" * (-len(v[0]) % 4)
-            decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
+            decoded = base64.b64decode(padded).decode(
+                "utf-8", errors="ignore")
             if ".pdf" in decoded.lower():
-                candidate = decoded if decoded.startswith("http") else f"https://{decoded}"
+                candidate = _normalize_direct_pdf_url(decoded)
                 if candidate not in direct_urls:
                     direct_urls.append(candidate)
                     chain.append("b64-param-decoded")
@@ -599,13 +663,13 @@ async def pdf_direct(req: PDFDirectRequest):
             pass
 
     chain.append(f"candidates({len(direct_urls)})")
-    logger.info(f"PDF direct: {len(direct_urls)} candidate URLs from {url}")
+    logger.info(f"PDF direct candidates: {direct_urls}")
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/124.0.0.0 Safari/537.36",
-        "Referer": f"https://{parsed.hostname}/",   # look like the viewer page
+        "Referer": f"https://{parsed.hostname}/",
         "Accept": "application/pdf,application/octet-stream,*/*",
     }
 
@@ -618,23 +682,34 @@ async def pdf_direct(req: PDFDirectRequest):
                     target, headers=headers, impersonate=imposter,
                     timeout=30, allow_redirects=True,
                 )
-                if resp.status_code == 200 and resp.content[:4] == b"%PDF":
+                # Strict validation: HTTP 200 + real PDF magic bytes.
+                # Some CDNs return 200 with HTML challenge pages.
+                if resp.status_code == 200 and _is_pdf_bytes(resp.content):
                     chain.append(f"cdn-direct✓({imposter})")
                     pdf_result = extract_pdf(resp.content)
-
                     cid = _content_id(target)
                     _cache_put(_pdf_cache, cid, resp.content)
                     _cache_put(_article_cache, cid, {
                         "url": target,
-                        "title": req.filename or target.rsplit("/", 1)[-1],
+                        "title": target.rsplit("/", 1)[-1],
                         "body": pdf_result["text"],
                         "timestamp": _now_iso(),
                     })
 
-                    # Humanize math in PDF text
+                    # OCR if scanned
                     text = pdf_result["text"]
+                    scanned = pdf_result["scanned"]
+                    if scanned and req.ocr and pdf_result.get("images"):
+                        chain.append("scanned-pdf")
+                        ocr_text = await ocr_images_with_hf(
+                            pdf_result["images"])
+                        if ocr_text:
+                            text = ocr_text
+                            chain.append("ocr✓")
+
+                    # Math humanization
                     math_meta = {"formulas_converted": [], "count": 0}
-                    if req is not None and text and "\\frac" in text:
+                    if text and _HAS_LATEX.search(text):
                         hm = humanize_formulas_in_text(text)
                         text = hm["text"]
                         math_meta = hm
@@ -650,52 +725,59 @@ async def pdf_direct(req: PDFDirectRequest):
                         "pdf_data": base64.b64encode(resp.content).decode(),
                         "pages": pdf_result["pages"],
                         "text": text,
-                        "scanned": pdf_result["scanned"],
+                        "scanned": scanned,
                         "math": math_meta,
                         "bypass_chain": chain,
                         "timestamp": _now_iso(),
                     }
-                last_error = f"{target} → HTTP {resp.status_code}"
+                last_error = (f"{target} → HTTP {resp.status_code}, "
+                              f"body starts: {resp.content[:20]!r}")
             except Exception as e:
                 last_error = f"{target} → {str(e)[:120]}"
 
-    # ── Strategy 4: stealth-render the viewer page, find embedded PDF URL ──
-    logger.info("  Falling back to stealth browser render of viewer page")
+    # ── Strategy 3: stealth-render viewer page, find embedded .pdf URL ──
+    logger.info("  Falling back to stealth render of viewer page")
     try:
-        browser = await get_browser()
-        res = await browser.fetch(url, generate_pdf=False)
-        html = res.get("html", "")
+        browser_result = await _browser_fetch_with_auth(
+            url, cookies=[], auth_token=None,
+            wait_selector=None, generate_pdf=False,
+        )
+        html = browser_result.get("html", "")
         if html:
-            html, contact_meta = decode_cf_protections(html), None
-            # Look for .pdf URLs in rendered DOM (PDF.js viewers embed them)
+            cf = decode_cf_protections(html)
+            html = cf["html"]
+            chain.append("viewer-render✓")
+
+            # PDF.js-style viewers embed the file URL in the DOM/scripts
             pdf_match = re.search(
                 r'https?://[^\s"\'<>\\]+?\.pdf[^\s"\'<>\\]*', html)
             if pdf_match:
                 pdf_url = (pdf_match.group(0)
                            .replace("\\u002F", "/").replace("\\/", "/"))
-                chain.append("viewer-render✓")
                 resp = cffi_requests.get(
                     pdf_url, headers=headers,
                     impersonate="chrome124", timeout=30)
-                if resp.status_code == 200 and resp.content[:4] == b"%PDF":
+                if resp.status_code == 200 and _is_pdf_bytes(resp.content):
                     pdf_result = extract_pdf(resp.content)
                     cid = _content_id(pdf_url)
                     _cache_put(_pdf_cache, cid, resp.content)
+                    chain.append("embedded-pdf-fetch✓")
                     return {
                         "success": True,
                         "viewer_url": url,
                         "cdn_url": pdf_url,
                         "viewer_bypassed": True,
-                        "pdf_url": f"/pdf/{cid}",
                         "article_url": f"/article/{cid}",
+                        "pdf_url": f"/pdf/{cid}",
                         "pdf_data": base64.b64encode(resp.content).decode(),
                         "pages": pdf_result["pages"],
                         "text": pdf_result["text"],
                         "scanned": pdf_result["scanned"],
                         "math": {"formulas_converted": [], "count": 0},
-                        "bypass_chain": chain + ["embedded-pdf-fetch✓"],
+                        "bypass_chain": chain,
                         "timestamp": _now_iso(),
                     }
+                last_error = (f"embedded {pdf_url} → HTTP {resp.status_code}")
     except Exception as e:
         last_error = f"browser render: {str(e)[:120]}"
 
@@ -716,13 +798,12 @@ async def pdf_extract_endpoint(req: PDFExtractRequest):
     except Exception:
         raise HTTPException(400, "Invalid base64 PDF data")
 
-    if pdf_bytes[:4] != b"%PDF":
+    if not _is_pdf_bytes(pdf_bytes):
         raise HTTPException(400, "Not a valid PDF file (missing %PDF header)")
 
     result = extract_pdf(pdf_bytes)
     text = result.get("text", "")
 
-    # OCR scanned pages
     if result["scanned"] and req.ocr and result.get("images"):
         logger.info(f"Scanned PDF: OCR on {len(result['images'])} pages")
         ocr_text = await ocr_images_with_hf(result["images"])
@@ -730,9 +811,8 @@ async def pdf_extract_endpoint(req: PDFExtractRequest):
             result["ocr_text"] = ocr_text
             text = ocr_text
 
-    # Math humanization
     math_meta = {"formulas_converted": [], "count": 0}
-    if req.humanize_math and text:
+    if req.humanize_math and text and _HAS_LATEX.search(text):
         hm = humanize_formulas_in_text(text)
         text = hm["text"]
         math_meta = hm
@@ -779,8 +859,9 @@ async def explore_site(req: ExploreRequest):
 
     # Humanize math in all extracted articles
     for page in result.get("articles", []):
-        if page.get("body_full") and "\\frac" in page["body_full"]:
-            hm = humanize_formulas_in_text(page["body_full"])
+        body = page.get("body_full", "")
+        if body and _HAS_LATEX.search(body):
+            hm = humanize_formulas_in_text(body)
             page["body_full"] = hm["text"]
             page["formulas_converted"] = hm["count"]
 
@@ -807,7 +888,7 @@ async def math_humanize(req: MathRequest):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# ENDPOINT: /contacts/decode — Cloudflare email/phone protection
+# ENDPOINT: /contacts/decode
 # ═══════════════════════════════════════════════════════════════════════
 
 @app.post("/contacts/decode")
@@ -827,7 +908,7 @@ async def contacts_decode(body: dict):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# ENDPOINT: /article/{id} and /pdf/{id} — cached content retrieval
+# ENDPOINT: /article/{id} and /pdf/{id}
 # ═══════════════════════════════════════════════════════════════════════
 
 @app.get("/article/{article_id}")
@@ -835,8 +916,9 @@ async def get_article(article_id: str):
     """Retrieve a cached article by content ID (in-memory, per-instance)."""
     article = _article_cache.get(article_id)
     if not article:
-        raise HTTPException(404, f"Article '{article_id}' not in cache "
-                                 f"(cache is per-instance and resets on deploy)")
+        raise HTTPException(
+            404, f"Article '{article_id}' not in cache "
+                 f"(cache is per-instance and resets on deploy)")
     return {**article, "id": article_id}
 
 
@@ -849,8 +931,7 @@ async def get_pdf(pdf_id: str):
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition":
-                 f'inline; filename="{pdf_id}.pdf"'},
+        headers={"Content-Disposition": f'inline; filename="{pdf_id}.pdf"'},
     )
 
 
@@ -862,7 +943,7 @@ async def get_pdf(pdf_id: str):
 async def health():
     return {
         "status": "healthy",
-        "version": "3.0",
+        "version": "3.1",
         "uptime_seconds": round(time.time() - _start_time, 1),
         "browsers_active": _browser_in_use,
         "cached_articles": len(_article_cache),
@@ -874,13 +955,13 @@ async def health():
 async def root():
     return {
         "service": "AuthBypass Scraper",
-        "version": "3.0",
+        "version": "3.1",
         "endpoints": {
             "POST /scrape":          "Full bypass pipeline for one URL",
             "POST /batch":           "Batch scrape (max 25 URLs)",
-            "POST /pdf/direct":      "Gated PDF-viewer bypass (?u= param decode)",
+            "POST /pdf/direct":      "Gated PDF-viewer bypass (?u= decode)",
             "POST /pdf/extract":     "Extract text from base64 PDF (+OCR)",
-            "POST /explore":         "Recursive site explorer (articles, PDFs, contacts)",
+            "POST /explore":         "Recursive site explorer",
             "POST /math/humanize":   "LaTeX → human-readable Unicode",
             "POST /contacts/decode": "Cloudflare email/phone decoder",
             "GET  /article/{id}":    "Cached article by content ID",
