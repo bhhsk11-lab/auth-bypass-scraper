@@ -14,6 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
     libxfixes3 libxrandr2 libgbm1 libasound2 libpango-1.0-0 \
     libcairo2 libatspi2.0-0 libx11-6 libxcb1 libxext6 \
+    libglib2.0-0 libdbus-1-3 libxshmfence1 libgtk-3-0 \
+    libu2f-udev libvulkan1 libexpat1 xdg-utils \
     fonts-liberation fonts-unifont fonts-freefont-ttf \
     fonts-noto-color-emoji fonts-wqy-zenhei \
     # pdf / ocr tooling

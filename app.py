@@ -23,6 +23,7 @@
 
  Endpoints:
    POST /scrape            Full bypass pipeline for one URL
+   POST /extract           NEWS BYTE extension compatibility shim (→ /scrape)
    POST /batch             Batch scrape (max 25)
    POST /pdf/direct        Gated PDF-viewer bypass (?u= decode)
    POST /pdf/extract       Extract text from uploaded base64 PDF (+OCR)
@@ -51,7 +52,9 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from config import settings
-from scraper.bypass import StealthFetcher, cf_decode_email, cf_decode_phones
+from scraper.bypass import (
+    StealthFetcher, cf_decode_email, cf_decode_phones, decode_cf_protections,
+)
 from scraper.browser import StealthBrowser
 from scraper.extractors import extract_article, extract_links, extract_pdf_links
 from scraper.math_pretty import humanize_formulas_in_text
@@ -345,6 +348,15 @@ class MathRequest(BaseModel):
     text: str
 
 
+class ExtractRequest(BaseModel):
+    """Matches the request body the NEWS BYTE extension sends to BOTH of
+    its Render servers (extractWithRenderServer() posts the same shape to
+    whichever host it's trying)."""
+    url: str
+    render: bool = False
+    max_chars: int = 60000
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # ENDPOINT: /debug/pdf  ★ NEW — run this FIRST when bypass fails
 # ═══════════════════════════════════════════════════════════════════════
@@ -598,12 +610,11 @@ async def scrape(req: ScrapeRequest):
     article = None
     if html:
         article = extract_article(html, url)
-        cf_emails, cf_phones = cf_decode_phones(html), []
-        # decode_cf style: emails + phones
-        from scraper.bypass import decode_cf_protections
         decoded = decode_cf_protections(html)
-        cf_emails = decoded.get("emails", [])
-        cf_phones = decoded.get("phones", [])
+        contact_meta = {
+            "emails": decoded.get("emails", []),
+            "phones": decoded.get("phones", []),
+        }
 
     needs_browser = (
         article is None
@@ -620,7 +631,6 @@ async def scrape(req: ScrapeRequest):
             if result.get("html"):
                 html = result["html"]
                 article = extract_article(html, url)
-                from scraper.bypass import decode_cf_protections
                 decoded = decode_cf_protections(html)
                 contact_meta = {
                     "emails": decoded.get("emails", []),
@@ -676,6 +686,44 @@ async def scrape(req: ScrapeRequest):
         "bypass_chain": chain,
         "used_browser": used_browser,
         "timestamp": _now_iso(),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ENDPOINT: /extract — compatibility shim for the NEWS BYTE extension
+# ═══════════════════════════════════════════════════════════════════════
+# The extension's extractWithRenderServer() always POSTs to "{server}/extract"
+# with {url, render, max_chars} and reads back {paragraphs, text, image,
+# word_count, method, resolved_url, extraction_score, errors, diagnostics}.
+# It uses this same call for BOTH Render deployments (the light extractor
+# and this bypass server) so it can fail over between them transparently.
+# This server's real pipeline lives at /scrape, so this just re-shapes that
+# response instead of duplicating the pipeline.
+@app.post("/extract")
+async def extract_compat(req: ExtractRequest):
+    try:
+        result = await scrape(ScrapeRequest(url=req.url, want_pdf=False))
+    except HTTPException as e:
+        detail = e.detail if isinstance(e.detail, dict) else {}
+        return {
+            "paragraphs": [], "text": "", "image": "",
+            "word_count": 0, "method": "bypass-failed",
+            "resolved_url": req.url, "extraction_score": 0,
+            "errors": [str(detail.get("last_error", e.detail))],
+            "diagnostics": {"bypass_chain": detail.get("bypass_chain", [])},
+        }
+    text = (result.get("text") or "")[: req.max_chars]
+    paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+    return {
+        "paragraphs": paragraphs,
+        "text": text,
+        "image": "",
+        "word_count": len(text.split()),
+        "method": "bypass-browser" if result.get("used_browser") else "bypass-http",
+        "resolved_url": result.get("url", req.url),
+        "extraction_score": 100 if len(text) >= 250 else 0,
+        "errors": [],
+        "diagnostics": {"bypass_chain": result.get("bypass_chain", [])},
     }
 
 
@@ -851,6 +899,7 @@ async def root():
         "version": "3.2",
         "endpoints": {
             "POST /scrape": "Full bypass pipeline for one URL",
+            "POST /extract": "NEWS BYTE extension compatibility shim (→ /scrape)",
             "POST /batch": "Batch scrape (max 25)",
             "POST /pdf/direct": "Gated PDF-viewer bypass (?u= decode)",
             "POST /pdf/extract": "Extract text from base64 PDF (+OCR)",

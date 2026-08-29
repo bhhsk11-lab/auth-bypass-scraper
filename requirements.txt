@@ -12,9 +12,14 @@ httpx==0.27.2
 
 # ── Stealth browser ────────────────────────────────────────────
 playwright==1.47.0
-# NOTE: browsers installed at build time via:
-#   playwright install --with-deps chromium
-# (already in the Dockerfile — do NOT need "playwright install" here)
+# NOTE: browser binaries are installed at build time via the Dockerfile's
+#   RUN playwright install chromium
+# (deliberately WITHOUT --with-deps: that flag makes Playwright resolve
+# its own apt package list, which references font package names that no
+# longer exist on Debian "trixie" (e.g. ttf-unifont/ttf-ubuntu-font-family)
+# and fails the build. The Dockerfile installs the equivalent libraries
+# itself by exact package name instead, then this line just fetches the
+# browser binary.)
 
 # ── HTML parsing / extraction ──────────────────────────────────
 beautifulsoup4==4.12.3
