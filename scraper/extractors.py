@@ -207,3 +207,82 @@ def extract_og_tags(html: str) -> dict:
             elif key == "body" and not result.get("body") or len(content) > len(result.get("body", "")):
                 result["body"] = content
     return result or None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Orchestrators — app.py imports these three directly. Everything above
+# this line is one individual extraction *strategy*; these functions are
+# what actually try them in order and normalize the result into the shape
+# the rest of the app expects. (These were missing entirely, which is why
+# `from scraper.extractors import extract_article, extract_links,
+# extract_pdf_links` failed at import time and crashed the whole service
+# on startup — none of the strategies above were ever unreachable, the
+# names the rest of the app calls simply didn't exist yet.)
+# ═══════════════════════════════════════════════════════════════════════
+
+def extract_article(html: str, url: str = "") -> dict | None:
+    """
+    Try every content-extraction strategy, strongest/least-lossy signal
+    first, and normalize whichever succeeds into
+    {title, text, html, source, author, date_published}.
+    Returns None only if every strategy comes back empty.
+    """
+    if not html:
+        return None
+
+    result = (
+        extract_from_json_ld(html)
+        or extract_from_next_data(html)
+        or extract_readability(html, url)
+    )
+    if not result:
+        og = extract_og_tags(html)
+        if og and og.get("body"):
+            result = {"title": og.get("title", ""), "body": og["body"], "source": "og-tags"}
+    if not result or not result.get("body"):
+        return None
+
+    return {
+        "title": result.get("title", ""),
+        "text": result.get("body", ""),
+        "html": html,
+        "source": result.get("source", ""),
+        "author": result.get("author", ""),
+        "date_published": result.get("date_published", ""),
+    }
+
+
+def extract_links(html: str, base_url: str = "") -> list[str]:
+    """Every distinct, resolved <a href> on the page (fragment stripped)."""
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "lxml")
+    seen, out = set(), []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            continue
+        full = urljoin(base_url, href) if base_url else href
+        full = full.split("#", 1)[0]
+        if full and full not in seen:
+            seen.add(full)
+            out.append(full)
+    return out
+
+
+def extract_pdf_links(html: str, base_url: str = "") -> list[str]:
+    """Every link on the page whose path looks like a PDF."""
+    if not html:
+        return []
+    pdf_pattern = re.compile(r"\.pdf(\?.*)?$", re.I)
+    soup = BeautifulSoup(html, "lxml")
+    seen, out = set(), []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href:
+            continue
+        full = urljoin(base_url, href) if base_url else href
+        if pdf_pattern.search(urlparse(full).path) and full not in seen:
+            seen.add(full)
+            out.append(full)
+    return out
