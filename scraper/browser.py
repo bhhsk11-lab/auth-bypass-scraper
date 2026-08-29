@@ -1,6 +1,8 @@
 """Stealth Playwright browser: 14-point fingerprint masking + cookie export."""
 import base64
 import logging
+import shutil
+import tempfile
 
 from playwright.async_api import async_playwright
 
@@ -69,10 +71,17 @@ class StealthBrowser:
         self.headless = headless
         self._pw = None
         self._context = None
+        self._profile_dir = None
 
     async def start(self):
         self._pw = await async_playwright().start()
+        # launch_persistent_context's first argument is a REQUIRED
+        # user_data_dir (a real profile path, not optional) — a fresh temp
+        # dir per process gives us the persistent-context APIs (needed for
+        # cookie/session export) without reusing state across runs.
+        self._profile_dir = tempfile.mkdtemp(prefix="nb-stealth-")
         self._context = await self._pw.chromium.launch_persistent_context(
+            self._profile_dir,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "
                        "Chrome/124.0.0.0 Safari/537.36",
@@ -114,6 +123,8 @@ class StealthBrowser:
                 await self._pw.stop()
             except Exception:
                 pass
+        if self._profile_dir:
+            shutil.rmtree(self._profile_dir, ignore_errors=True)
 
     async def fetch(self, url: str, generate_pdf: bool = False) -> dict:
         """Fetch page in stealth context. Returns html, text, cookies,
