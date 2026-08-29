@@ -1,392 +1,161 @@
-"""
-Multi-layer authorization bypass engine.
-Implements the cheat-sheet strategies for bypassing access controls.
-"""
-import asyncio
+"""Stealth HTTP layer: curl_cffi TLS impersonation + anti-paywall tricks."""
 import base64
-import hashlib
-import json
-import random
+import logging
 import re
-import time
-from io import BytesIO
-from typing import Any
-from urllib.parse import urlparse, urljoin, parse_qs, urlencode
+from urllib.parse import urljoin
 
-from bs4 import BeautifulSoup
 from curl_cffi import requests as cffi_requests
-from PIL import Image
 
-# ─── IMPOSTER PROFILES ──────────────────────────────────────────────────
+from config import settings
 
-TLS_IMPOSTERS = [
-    "chrome124", "chrome123", "chrome120",
-    "safari17_0", "safari16_5",
-    "edge101", "edge99",
-    "firefox123", "firefox118",
-]
+logger = logging.getLogger("bypass")
 
-BOT_AGENTS = [
-    # Googlebot variants
-    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-    "Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/W.X.Y.Z Mobile Safari/537.36 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 10_0 like Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) Version/10.0 Mobile Safari/537.36 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-    # Bingbot
-    "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
-    # DuckDuckBot
-    "Mozilla/5.0 (compatible; DuckDuckBot-Https/1.1; https://duckduckgo.com/duckduckbot)",
-    # Facebook crawler
-    "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-    "Mozilla/5.0 (compatible; FacebookBot/1.0; +https://developers.facebook.com/docs/sharing/bot)",
-    # Twitter
-    "Twitterbot/1.0",
-    # Apple/Google preview bots
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15 (Applebot/0.1)",
-    "Mozilla/5.0 (compatible; Google-Apps-Script; apps-script; +https://script.google.com)",
-]
-
-REAL_BROWSER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-]
+BOT_UAS = {
+    "googlebot": ("Mozilla/5.0 (compatible; Googlebot/2.1; "
+                  "+http://www.google.com/bot.html)"),
+    "bingbot": ("Mozilla/5.0 (compatible; bingbot/2.0; "
+                "+http://www.bing.com/bingbot.htm)"),
+}
 
 SOCIAL_REFERERS = [
     "https://t.co/",
     "https://www.facebook.com/",
-    "https://l.facebook.com/l.php",
     "https://news.google.com/",
-    "https://www.google.com/",
-    "https://www.google.com/search?q=",
-    "https://reddit.com/",
-    "https://www.reddit.com/r/all/",
     "https://www.linkedin.com/",
-    "https://out.reddit.com/",
-    "https://x.com/",
-    "https://twitter.com/",
 ]
 
-# ─── PAYWALL / BOT DETECTION SCRIPTS TO NEUTRALIZE ─────────────────────
-
-BLOCKED_SCRIPT_PATTERNS = [
-    # Paywall providers
-    "piano.io", "tinypass", "tp_", "permutive", "zephr",
-    "paywall", "poool", "sophi", "marfeel", "leaky-paywall",
-    "moneypenny", "atlas.recaptcha",
-    # Meter detection
-    "meter.", "metered", "article-count", "nqs",
-    # Analytics that feed paywall decisions
-    "chartbeat", "parsely", "criteo", "outbrain", "taboola",
-    # Consent/CMP
-    "cmp.quantcast", "consentmanager", "onesignal",
-    # Google services that track
-    "doubleclick", "googlesyndication", "googletagmanager",
-    "google-analytics", "gtag", "pagead2",
-]
-
-# ─── ANTI-PAYWALL COOKIE NAMES ──────────────────────────────────────────
-
-ANTI_PAYWALL_COOKIE_NAMES = [
-    "piano", "tinypass", "tp_", "permutive", "pa-", "meter",
-    "nytimes_meter", "wp-settings", "article_views", "read_count",
-    "visits", "subscription", "premium", "access", "wall",
-    "ngage", "nqs", "nq_meter", "nq_visited", "nq_article_count",
-    "ar_debug", "articleCount", "articleCountSession",
+ANTI_PAYWALL_COOKIES = [
+    # meter-reset / fake-subscriber cookies (Piano/TinyPass-style + common CX)
+    {"name": "piano_meter", "value": "0"},
+    {"name": "nxti", "value": "0"},
+    {"name": "ni_ispaid", "value": "1"},
+    {"name": "grv_wl", "value": "1"},
+    {"name": "sub", "value": "1"},
+    {"name": "edition-paid", "value": "1"},
 ]
 
 
-def build_anti_paywall_cookies(domain: str) -> list[dict]:
-    """
-    Inject cookies that trick paywall scripts into thinking:
-    - User has never visited (meter reset)
-    - User has an active subscription
-    - User came from social media
-    """
-    cookies = []
-    base = {"domain": domain, "path": "/"}
-
-    # Reset ALL meter counters to zero
-    for name in ANTI_PAYWALL_COOKIE_NAMES:
-        if any(x in name.lower() for x in ["meter", "count", "visit", "view", "nq_"]):
-            cookies.append({**base, "name": name, "value": "0"})
-
-    # Fake subscription cookies for common paywall providers
-    cookies.append({**base, "name": "tp_subscriber", "value": "true"})
-    cookies.append({**base, "name": "tp_is_logged_in", "value": "true"})
-    cookies.append({**base, "name": "piano_user_id", "value": f"bot_{random.randint(100000,999999)}"})
-    cookies.append({**base, "name": "piano_is_subscriber", "value": "true"})
-    cookies.append({**base, "name": "piano_token", "value": hashlib.sha256(str(random.random()).encode()).hexdigest()})
-
-    # Fake that user came from Google/search
-    cookies.append({**base, "name": "ref", "value": "google"})
-    cookies.append({**base, "name": "utm_source", "value": "google"})
-    cookies.append({**base, "name": "fb_referer", "value": "1"})
-
-    return cookies
-
-
-def build_browser_like_headers(url: str, use_bot_ua: bool = False) -> dict:
-    """Craft headers indistinguishable from a real browser."""
-    parsed = urlparse(url)
-    agent = random.choice(BOT_AGENTS if use_bot_ua else REAL_BROWSER_AGENTS)
-    return {
-        "User-Agent": agent,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": random.choice(SOCIAL_REFERERS),
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "cross-site",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Host": parsed.hostname or "",
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# LAYER 0: TLS-Impersonated HTTP (curl_cffi)
-# ═══════════════════════════════════════════════════════════════════════
-
-async def try_http_fetch(url: str, cookies: list[dict] | None = None,
-                         timeout: int = 20) -> tuple[str | None, dict]:
-    """
-    60-70% of bot-protected sites pass with TLS impersonation alone.
-
-    Returns (html_text, metadata).
-    """
-    imposter = random.choice(TLS_IMPOSTERS)
-    headers = build_browser_like_headers(url, use_bot_ua=False)
-
-    # Also try with bot UA if first attempt fails
-    for attempt, ua_type in enumerate([headers, {**headers, "User-Agent": random.choice(BOT_AGENTS)}]):
-        try:
-            resp = cffi_requests.get(
-                url,
-                headers=ua_type,
-                impersonate=imposter,
-                timeout=timeout,
-                cookies={c["name"]: c["value"] for c in (cookies or [])},
-                allow_redirects=True,
-            )
-            if resp.status_code == 200 and resp.text and len(resp.text) > 300:
-                return resp.text, {
-                    "method": "curl_cffi",
-                    "impersonate": imposter,
-                    "status": resp.status_code,
-                    "bot_ua": ua_type != headers,
-                }
-        except Exception:
-            continue
-
-    return None, {"method": "curl_cffi", "status": "failed"}
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# LAYER 1: Archive/Cache Fallback
-# ═══════════════════════════════════════════════════════════════════════
-
-ARCHIVE_MIRRORS = [
-    "https://archive.ph/newest/{url}",
-    "https://archive.is/newest/{url}",
-    "https://webcache.googleusercontent.com/search?q=cache:{url}",
-    "https://r.jina.ai/http://{url}",
-    "https://12ft.io/proxy?q={url}",
-    "https://corsproxy.io/?url={url}",
-    "https://textise dot iitty/{url}",
-]
-
-ARCHIVE_PROXY_ROTATION = [
-    # These are proxy services — check for updated URLs before production use
-    "https://api.allorigins.win/get?url={url}",
-    "https://api.codetabs.com/v1/proxy?quest={url}",
-]
-
-
-async def try_archive_fetch(url: str, timeout: int = 25) -> tuple[str | None, dict]:
-    """
-    Server-side paywalls: fetch from archives that already have full content.
-    """
-    for mirror in ARCHIVE_MIRRORS:
-        target = mirror.format(url=url)
-        try:
-            resp = cffi_requests.get(
-                target,
-                impersonate=random.choice(TLS_IMPOSTERS),
-                timeout=timeout,
-                headers={"User-Agent": random.choice(BOT_AGENTS)},
-                allow_redirects=True,
-            )
-            if resp.status_code == 200 and resp.text and len(resp.text) > 1500:
-                return resp.text, {"method": "archive", "mirror": mirror.split("/")[2]}
-        except Exception:
-            continue
-
-    # Try proxy rotation services
-    for proxy in ARCHIVE_PROXY_ROTATION:
-        target = proxy.format(url=url)
-        try:
-            resp = cffi_requests.get(
-                target,
-                impersonate="chrome124",
-                timeout=timeout + 10,
-            )
-            if resp.status_code == 200:
-                # Some proxies wrap content in JSON
-                try:
-                    data = resp.json()
-                    content = data.get("contents") or data.get("body") or resp.text
-                except Exception:
-                    content = resp.text
-                if content and len(str(content)) > 1000:
-                    return str(content), {"method": "proxy", "service": proxy.split("//")[1].split("/")[0]}
-        except Exception:
-            continue
-
-    return None, {"method": "archive", "status": "exhausted"}
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# LAYER 2: AMP / Mobile / Print Version Detection
-# ═══════════════════════════════════════════════════════════════════════
-
-AMP_SIGNALS = [
-    lambda u: u.replace("://", "://amp.") if not u.startswith("https://amp.") and not u.startswith("http://amp.") else None,
-    lambda u: u + "?amp=1" if "?" not in u else u + "&amp=1",
-    lambda u: u + "/amp" if not u.endswith("/amp") else None,
-    lambda u: u.replace("/article/", "/amp/"),
-    lambda u: u.replace("/story/", "/amp/"),
-    lambda u: u.replace("https://", "https://m.").replace("http://", "http://m."),
-    lambda u: u + "?output=print" if "?" not in u else u + "&output=print",
-    lambda u: u.replace("/article/", "/print/"),
-    lambda u: u.replace("/news/", "/print/"),
-]
-
-
-async def try_amp_mobile_print(url: str, timeout: int = 15) -> tuple[str | None, dict]:
-    """Probe alternative versions (AMP, mobile, print) that bypass paywalls."""
-    for transformer in AMP_SIGNALS:
-        try:
-            alt_url = transformer(url)
-            if not alt_url or alt_url == url:
-                continue
-            resp = cffi_requests.get(
-                alt_url,
-                impersonate="chrome124",
-                timeout=timeout,
-                headers={"User-Agent": random.choice(BOT_AGENTS)},
-                allow_redirects=True,
-            )
-            if resp.status_code == 200 and resp.text and len(resp.text) > 1000:
-                return resp.text, {"method": "alt_version", "alt_url": alt_url}
-        except Exception:
-            continue
-    return None, {"method": "alt_version", "status": "failed"}
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# LAYER 3: Cookie / Session Injection
-# ═══════════════════════════════════════════════════════════════════════
-
-def parse_cookie_header(cookie_str: str) -> list[dict]:
-    """Parse browser-exported cookies into our format."""
-    cookies = []
-    for line in cookie_str.split(";"):
-        if "=" in line:
-            name, value = line.strip().split("=", 1)
-            cookies.append({"name": name, "value": value, "domain": "", "path": "/"})
-    return cookies
-
-
-def extract_cf_clearance_from_html(html: str) -> str | None:
-    """
-    Cloudflare issues cf_clearance cookie after JS challenge.
-    Extract from HTML meta refresh or redirect URL.
-    """
-    soup = BeautifulSoup(html, "lxml")
-    meta = soup.find("meta", {"http-equiv": "refresh"})
-    if meta and meta.get("content"):
-        m = re.search(r'cf_clearance=([^&;%]+)', meta["content"])
-        if m:
-            return m.group(1)
+def _proxies() -> dict | None:
+    if settings.proxy_url:
+        return {"http": settings.proxy_url, "https": settings.proxy_url}
     return None
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# PDF AS INTERMEDIARY (print-to-PDF captures rendered content)
-# ═══════════════════════════════════════════════════════════════════════
+class StealthFetcher:
+    """Layered HTTP fetch: TLS impersonation → bot UA → social referer."""
 
-def html_has_paywall_markers(html: str) -> bool:
-    """Quick heuristic: check if content appears to be paywalled."""
-    text = BeautifulSoup(html, "lxml").get_text()[:5000].lower()
-    indicators = ["subscribe now", "sign up to read", "unlock this",
-                  "become a subscriber", "subscription required",
-                  "you've reached your", "free article limit",
-                  "log in to read", "premium content", "continue reading",
-                  "please subscribe", "this is a premium"]
-    return any(i in text for i in indicators)
+    IMPERSONATE_CHAIN = ["chrome124", "safari17_0", "edge101", "firefox133"]
+
+    async def fetch_html(self, url: str) -> str:
+        last_err = None
+        for imposter in self.IMPERSONATE_CHAIN:
+            try:
+                r = cffi_requests.get(
+                    url,
+                    impersonate=imposter,
+                    timeout=settings.request_timeout,
+                    allow_redirects=True,
+                    proxies=_proxies(),
+                    headers={
+                        "Accept": ("text/html,application/xhtml+xml,"
+                                   "application/xml;q=0.9,*/*;q=0.8"),
+                        "Accept-Language": "en-US,en;q=0.9",
+                        "Sec-Fetch-Dest": "document",
+                        "Sec-Fetch-Mode": "navigate",
+                        "Sec-Fetch-Site": "none",
+                        "Upgrade-Insecure-Requests": "1",
+                    },
+                )
+                if r.status_code == 200:
+                    return r.text
+                last_err = f"HTTP {r.status_code} ({imposter})"
+            except Exception as e:
+                last_err = str(e)
+        # bot-UA fallback
+        for name, ua in BOT_UAS.items():
+            try:
+                r = cffi_requests.get(
+                    url, headers={"User-Agent": ua,
+                                  "From": f"googlebot(at)googlebot.com"},
+                    impersonate="chrome124",
+                    timeout=settings.request_timeout,
+                    allow_redirects=True, proxies=_proxies())
+                if r.status_code == 200:
+                    return r.text
+            except Exception as e:
+                last_err = str(e)
+        raise RuntimeError(f"All stealth HTTP attempts failed: {last_err}")
+
+    async def fetch_archive(self, url: str) -> str | None:
+        """archive.is / web.archive.org fallback."""
+        for archive in (f"https://archive.ph/newest/{url}",
+                        f"https://web.archive.org/web/2024/{url}"):
+            try:
+                r = cffi_requests.get(
+                    archive, impersonate="chrome124",
+                    timeout=45, allow_redirects=True, proxies=_proxies())
+                if r.status_code == 200 and len(r.text) > 2000:
+                    return r.text
+            except Exception:
+                continue
+        return None
 
 
-# ─── BYPASS PIPELINE ORCHESTRATOR ──────────────────────────────────────
+# ── Cloudflare email/phone protection decoding ─────────────────────────
 
-async def run_bypass_pipeline(url: str, cookies: list[dict] | None = None,
-                              auth_token: str | None = None,
-                              timeout: int = 90) -> dict:
-    """
-    Full orchestration: try each layer in order.
-    Returns the HTML + metadata from the first successful layer.
-    """
-    chain = []
-    result_html = None
-    result_meta = {}
-    all_cookies = list(cookies or [])
+def cf_decode_email(hex_str: str) -> str:
+    """1-byte XOR reversal of data-cfemail hex."""
+    try:
+        key = int(hex_str[:2], 16)
+        return "".join(
+            chr(int(hex_str[i:i + 2], 16) ^ key)
+            for i in range(2, len(hex_str), 2))
+    except (ValueError, IndexError):
+        return ""
 
-    # Prepend anti-paywall cookies
-    if cookies:
-        all_cookies = cookies
-    all_cookies.extend(build_anti_paywall_cookies(urlparse(url).hostname or ""))
 
-    # Layer 0: TLS-impersonated HTTP
-    chain.append("curl_cffi")
-    html, meta = await try_http_fetch(url, all_cookies, min(timeout, 20))
-    if html:
-        result_html = html
-        result_meta = {**meta, "layer": "curl_cffi"}
+def cf_decode_phones(html: str) -> list[str]:
+    """Phones obfuscated via /cdn-cgi/l/ links (same XOR scheme)."""
+    phones = []
+    for m in re.finditer(
+            r'href="/cdn-cgi/l/([a-z-]+-protection[^"]*)#([0-9a-fA-F]+)"',
+            html):
+        decoded = cf_decode_email(m.group(2))
+        if decoded and any(c.isdigit() for c in decoded) \
+                and "@" not in decoded:
+            phones.append(decoded)
+    return phones
 
-    # Layer 1: AMP / mobile / print versions
-    if not result_html or html_has_paywall_markers(result_html):
-        chain.append("alt_version")
-        html, meta = await try_amp_mobile_print(url, min(timeout, 15))
-        if html and not html_has_paywall_markers(html):
-            result_html = html
-            result_meta = {**meta, "layer": "alt_version"}
 
-    # Layer 2: Archives / cached copies
-    if not result_html or html_has_paywall_markers(result_html):
-        chain.append("archive")
-        html, meta = await try_archive_fetch(url, min(timeout, 25))
-        if html:
-            result_html = html
-            result_meta = {**meta, "layer": "archive"}
+def decode_cf_protections(html: str) -> dict:
+    """Decode all Cloudflare-protected contacts from raw HTML."""
+    emails: list[str] = []
+    phones: list[str] = []
 
-    # If we got nothing at all, return failure
-    if not result_html:
-        return {
-            "success": False,
-            "chain": chain,
-            "error": "All bypass layers exhausted",
-            "html": None,
-        }
+    # <span data-cfemail="HEX">
+    for m in re.finditer(r'data-cfemail="([0-9a-fA-F]+)"', html):
+        e = cf_decode_email(m.group(1))
+        if e and "@" in e:
+            emails.append(e)
 
-    return {
-        "success": True,
-        "chain": chain,
-        "html": result_html,
-        "meta": result_meta,
-    }
+    # <a href="/cdn-cgi/l/email-protection#HEX">
+    for m in re.finditer(
+            r'href="/cdn-cgi/l/email-protection#([0-9a-fA-F]+)"', html):
+        e = cf_decode_email(m.group(1))
+        if e and "@" in e:
+            emails.append(e)
+
+    # phones via cdn-cgi links
+    phones = cf_decode_phones(html)
+
+    # plain-text fallback
+    for m in re.finditer(
+            r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', html):
+        emails.append(m.group(0))
+    for m in re.finditer(r'(?:\+91[\-\s]?|0)?[6-9]\d{9}', html):
+        phones.append(m.group(0))
+
+    # dedupe, preserve order
+    emails = list(dict.fromkeys(emails))
+    phones = list(dict.fromkeys(p.strip() for p in phones))
+    return {"emails": emails, "phones": phones}
