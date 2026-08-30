@@ -18,7 +18,7 @@ from pydantic import BaseModel, HttpUrl
 # Google News resolver
 # IMPORTANT: gnews_resolver.py is inside scraper/
 # ============================================================
-from scraper.gnews_resolver import resolve_google_news as gnews_resolve
+from gnews_resolver import resolve_google_news as gnews_resolve
 
 
 # ============================================================
