@@ -114,7 +114,9 @@ def _walk_for_title(obj, depth=0):
 
 def extract_readability(html: str, url: str = "") -> dict | None:
     """
-    DOM-based extraction: strip all non-article elements.
+    DOM-based extraction: strip all non-article elements, then pick the
+    container that actually looks like the article body — not just the
+    first one whose class/id happens to contain a matching word.
     Works when content IS in the DOM but hidden by overlay.
     """
     soup = BeautifulSoup(html, "lxml")
@@ -125,17 +127,33 @@ def extract_readability(html: str, url: str = "") -> dict | None:
                      "select", "input", "textarea"]):
         tag.decompose()
 
-    # Strip ad/promo elements by class/id
+    # Strip ad/promo elements by class/id. Matched as a whole word bounded
+    # by a hyphen/underscore/space or the start/end of the string — e.g.
+    # this correctly catches compound classes like "ad-slot" or
+    # "cookie-banner" (a naive per-token check misses these, since they're
+    # one hyphenated token, not two space-separated ones) while no longer
+    # nuking unrelated ids that just happen to contain the word as a raw
+    # substring, like "readMoreButton", "leaderboard-standings" or
+    # "already-loaded" all containing "ad", or "download-pdf" containing
+    # "ad" too — a bug that was silently stripping real article containers
+    # on plenty of pages, including ones with no ads on them at all.
     noise_classes = ["ad", "ads", "advert", "advertisement", "promo",
                      "promotion", "banner", "newsletter", "related",
                      "recommended", "share", "social", "comments",
                      "paywall", "gate", "wall", "overlay", "modal",
                      "popup", "pop-up", "subscription", "cta",
                      "sidebar", "widget", "cookie", "consent"]
-    for cls in noise_classes:
-        for el in soup.find_all(class_=lambda c: c and cls in str(c).lower().split()):
-            el.decompose()
-        for el in soup.find_all(id=lambda i: i and cls in str(i).lower()):
+    noise_re = re.compile(
+        r'(?:^|[-_\s])(?:' + "|".join(re.escape(w) for w in noise_classes) + r')(?:[-_\s]|$)',
+        re.IGNORECASE)
+    def is_noise(el):
+        cls = " ".join(el.get("class", []))
+        eid = el.get("id", "") or ""
+        return bool(noise_re.search(cls) or noise_re.search(eid))
+    for el in soup.find_all(True):
+        if el.parent is None:
+            continue  # already removed as part of an earlier decompose()
+        if is_noise(el):
             el.decompose()
 
     # Remove elements with paywall-indicating text
@@ -148,15 +166,30 @@ def extract_readability(html: str, url: str = "") -> dict | None:
         if any(w in text for w in paywall_words) and len(text) < 200:
             el.decompose()
 
-    # Find main content
-    article = (
-        soup.find("article")
-        or soup.find("main", {"role": "main"})
-        or soup.find("div", {"class": lambda c: c and "content" in str(c).lower()})
-        or soup.find("div", {"class": lambda c: c and "article" in str(c).lower()})
-        or soup.find("div", {"id": lambda i: i and ("content" in str(i).lower() or "article" in str(i).lower())})
-        or soup.body
-    )
+    # Find the main content container. An <article> tag or role=main <main>
+    # is trusted outright — those are explicit semantic signals. Otherwise,
+    # score every plausible container by how much real paragraph text it
+    # holds rather than taking the FIRST div/section whose class or id
+    # merely mentions "content"/"article" — a page's first such match in
+    # document order is very often a small "related content" or "trending"
+    # rail above the real story, not the story itself.
+    article = soup.find("article") or soup.find("main", {"role": "main"}) or soup.find("main")
+    if not article:
+        candidates = soup.find_all(["div", "section"])
+        best, best_score = None, 0
+        for el in candidates:
+            paras = el.find_all("p", recursive=True)
+            text_len = sum(len(p.get_text(strip=True)) for p in paras)
+            if len(paras) < 2 or text_len < 200:
+                continue
+            # Prefer containers whose own class/id hints at being the story,
+            # but this is now a tie-breaking bonus, not the sole criterion.
+            hint = 1.15 if re.search(r'content|article|story|body|post|entry',
+                                      f'{" ".join(el.get("class", []))} {el.get("id", "")}', re.I) else 1.0
+            score = text_len * hint
+            if score > best_score:
+                best, best_score = el, score
+        article = best or soup.body
 
     if not article:
         return None
@@ -209,8 +242,48 @@ def extract_og_tags(html: str) -> dict:
     return result or None
 
 
+def extract_image(html: str, url: str = "") -> str:
+    """
+    Publisher hero image — og:image / twitter:image meta tags first (these
+    are what the article was actually tagged with for sharing, so they're
+    the most reliable single image), falling back to the largest plausible
+    content <img> if neither meta tag is present. Always returned as an
+    absolute URL, or "" if nothing usable was found.
+    """
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "lxml")
+    for prop in ("og:image:secure_url", "og:image", "twitter:image", "twitter:image:src"):
+        tag = soup.find("meta", {"property": prop}) or soup.find("meta", {"name": prop})
+        content = tag.get("content", "").strip() if tag else ""
+        if content:
+            resolved = urljoin(url, content) if url else content
+            if resolved.lower().startswith(("http://", "https://")):
+                return resolved
+
+    # No meta image — fall back to the first reasonably-sized <img> inside
+    # the likely article body, skipping obvious icon/logo/tracking pixels.
+    for img in soup.find_all("img"):
+        src = img.get("src") or img.get("data-src") or ""
+        if not src:
+            continue
+        cls = f'{" ".join(img.get("class", []))} {img.get("id", "")}'.lower()
+        if re.search(r'\b(logo|icon|avatar|sprite|pixel|spinner|placeholder)\b', cls):
+            continue
+        try:
+            w, h = int(img.get("width", 0) or 0), int(img.get("height", 0) or 0)
+        except ValueError:
+            w, h = 0, 0
+        if (w and w < 150) or (h and h < 150):
+            continue
+        resolved = urljoin(url, src) if url else src
+        if resolved.lower().startswith(("http://", "https://")):
+            return resolved
+    return ""
+
+
 # ═══════════════════════════════════════════════════════════════════════
-# Orchestrators — app.py imports these three directly. Everything above
+# Orchestrators — app.py imports these directly. Everything above
 # this line is one individual extraction *strategy*; these functions are
 # what actually try them in order and normalize the result into the shape
 # the rest of the app expects. (These were missing entirely, which is why

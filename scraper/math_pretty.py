@@ -1,4 +1,4 @@
-"""
+r"""
 Math formula humanizer: LaTeX → human-readable Unicode.
 Handles \frac, ^, _, \times, \infty, Greek letters, etc.
 Optional sympy fallback for complex expressions.
@@ -40,6 +40,61 @@ def _to_sub(s: str) -> str:
     return "".join(SUBSCRIPTS.get(c, c) for c in s)
 
 
+_FRAC_RE = re.compile(r"\\[dt]?frac\s*")
+
+
+def _find_matching_brace(s: str, open_idx: int) -> int:
+    """s[open_idx] must be '{'. Returns the index of its matching '}',
+    correctly skipping over any nested {..} pairs in between, or -1 if
+    the braces are unbalanced."""
+    depth = 0
+    for i in range(open_idx, len(s)):
+        if s[i] == "{":
+            depth += 1
+        elif s[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _convert_fracs(s: str) -> str:
+    """Convert \\frac{a}{b} (and \\dfrac, \\tfrac) to (a)/(b).
+
+    Unlike a single regex with [^{}]* arguments, this handles a or b
+    containing further nested braces — e.g. \\frac{-b}{\\sqrt{b^2-4ac}}
+    or a \\frac nested inside another \\frac. A plain [^{}]* regex simply
+    fails to match in that case (very common: sqrt-over-something, or
+    fraction-of-a-fraction), leaving \\frac unconverted; it then falls
+    through to the generic residual-brace/command stripper later in
+    latex_to_readable, which deletes the braces and the \\frac command
+    without ever inserting the "/" — silently concatenating the numerator
+    and denominator with no operator between them instead of dividing.
+    """
+    out = []
+    i = 0
+    while i < len(s):
+        m = _FRAC_RE.match(s, i)
+        if m and m.end() < len(s) and s[m.end()] == "{":
+            num_start = m.end()
+            num_end = _find_matching_brace(s, num_start)
+            if num_end != -1:
+                j = num_end + 1
+                while j < len(s) and s[j].isspace():
+                    j += 1
+                if j < len(s) and s[j] == "{":
+                    den_end = _find_matching_brace(s, j)
+                    if den_end != -1:
+                        numerator = _convert_fracs(s[num_start + 1:num_end])
+                        denominator = _convert_fracs(s[j + 1:den_end])
+                        out.append(f"({numerator})/({denominator})")
+                        i = den_end + 1
+                        continue
+        out.append(s[i])
+        i += 1
+    return "".join(out)
+
+
 def latex_to_readable(latex: str) -> str:
     """Convert a LaTeX string to human-readable Unicode text."""
     s = latex.strip()
@@ -47,10 +102,10 @@ def latex_to_readable(latex: str) -> str:
     # Strip delimiters: \( ... \), $ ... $, \[ ... \]
     s = re.sub(r'^\\\(|\\\)$|^\$|\$$|^\\\[|\\\]$', "", s)
 
-    # \frac{a}{b} → (a)/(b);  \dfrac, \tfrac same
-    s = re.sub(r"\\[dt]?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}", r"(\1)/(\2)", s)
-    # handle nested: run twice
-    s = re.sub(r"\\[dt]?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}", r"(\1)/(\2)", s)
+    # \frac{a}{b} → (a)/(b);  \dfrac, \tfrac same. Balanced-brace scan
+    # (not a plain regex) so nested content — \sqrt{...}, another \frac,
+    # etc. — inside a or b is handled correctly. See _convert_fracs().
+    s = _convert_fracs(s)
 
     # \sqrt{a} → √(a), \sqrt[n]{a} → ⁿ√(a)
     s = re.sub(r"\\sqrt\s*\[([^\]]+)\]\s*\{([^{}]*)\}", lambda m: _to_super(m.group(1)) + "√(" + m.group(2) + ")", s)
