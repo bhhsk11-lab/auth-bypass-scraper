@@ -18,7 +18,7 @@ from pydantic import BaseModel, HttpUrl
 # Google News resolver
 # IMPORTANT: gnews_resolver.py is inside scraper/
 # ============================================================
-from scraper.gnews_resolver import resolve_google_news as gnews_resolve
+from scraper.gnews_resolver import resolve_gnews_url
 
 
 # ============================================================
@@ -66,6 +66,16 @@ MAX_DOWNLOAD_BYTES = 8_000_000
 MIN_GOOD_WORDS = 120
 MIN_GOOD_SCORE = 0.30
 
+# Bounded upstream timeouts. Keep these below the platform request
+# timeout so /extract can return a useful response instead of being
+# killed by an outer 30-second request timeout.
+GOOGLE_RESOLVE_TIMEOUT = 10.0
+HTTP_TOTAL_TIMEOUT = 12.0
+HTTP_CONNECT_TIMEOUT = 5.0
+RENDER_NAV_TIMEOUT_MS = 12000
+RENDER_MAX_WAIT_MS = 2500
+AUTO_RENDER_GOOGLE = True
+
 
 # ============================================================
 # Google News helpers
@@ -88,7 +98,9 @@ def is_google_news_article_url(url: str) -> bool:
 
 async def resolve_google_news_url(url: str):
     """
-    Resolve Google News article URLs.
+    Resolve a Google News article URL without blocking the FastAPI
+    event loop. The resolver itself is synchronous, so it runs in a
+    worker thread and is bounded by GOOGLE_RESOLVE_TIMEOUT.
 
     Returns:
         (resolved_url, method)
@@ -98,23 +110,48 @@ async def resolve_google_news_url(url: str):
         return url, None
 
     try:
-        resolved, method = await gnews_resolve(url)
-
-        logger.info(
-            "Google News resolve: %s -> %s (%s)",
-            url[:120],
-            resolved[:120] if resolved else None,
-            method,
+        result = await asyncio.wait_for(
+            asyncio.to_thread(resolve_gnews_url, url),
+            timeout=GOOGLE_RESOLVE_TIMEOUT,
         )
 
-        if resolved and resolved != url:
+        if hasattr(result, "success"):
+            resolved = result.resolved_url
+            method = result.method
+            error = result.error
+        elif isinstance(result, dict):
+            resolved = result.get("resolved_url") or result.get("url")
+            method = result.get("method")
+            error = result.get("error")
+        else:
+            resolved = None
+            method = None
+            error = "invalid-resolver-result"
+
+        logger.info(
+            "Google News resolve: %s -> %s (%s)%s",
+            url[:120],
+            resolved[:160] if resolved else None,
+            method or "failed",
+            f" error={error}" if error else "",
+        )
+
+        # Never treat another Google News URL as a successful resolution.
+        if resolved and resolved != url and not is_google_news_article_url(resolved):
             return resolved, method or "resolver"
 
-        return url, method or "not-resolved"
+        return url, method or (f"resolver-failed:{error}" if error else "not-resolved")
+
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Google News resolver timeout after %.1fs: %s",
+            GOOGLE_RESOLVE_TIMEOUT,
+            url[:160],
+        )
+        return url, "resolver-timeout"
 
     except Exception as exc:
         logger.exception("Google News resolver failed")
-
         return url, f"resolver-error:{type(exc).__name__}"
 
 
@@ -853,8 +890,11 @@ async def fetch_html(url: str):
     }
 
     timeout = httpx.Timeout(
-        20.0,
-        connect=10.0,
+        HTTP_TOTAL_TIMEOUT,
+        connect=HTTP_CONNECT_TIMEOUT,
+        read=HTTP_TOTAL_TIMEOUT,
+        write=HTTP_TOTAL_TIMEOUT,
+        pool=HTTP_CONNECT_TIMEOUT,
     )
 
     async with httpx.AsyncClient(
@@ -942,10 +982,10 @@ async def fetch_rendered(url: str):
             await page.goto(
                 url,
                 wait_until="domcontentloaded",
-                timeout=30000,
+                timeout=RENDER_NAV_TIMEOUT_MS,
             )
 
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(900)
 
             await page.evaluate(
                 "window.scrollTo(0, document.body.scrollHeight * 0.70)"
@@ -984,6 +1024,7 @@ async def extract_one(
     errors = []
 
     requested_url = url
+    was_google_news = is_google_news_article_url(requested_url)
     last_result = None
 
     # --------------------------------------------------------
@@ -1079,7 +1120,7 @@ async def extract_one(
     # Playwright fallback
     # --------------------------------------------------------
 
-    if render:
+    if render or (AUTO_RENDER_GOOGLE and was_google_news):
         try:
             html, final_url = (
                 await fetch_rendered(url)
