@@ -1,28 +1,28 @@
+```python
+from __future__ import annotations
+
 import asyncio
 import ipaddress
-import json
 import logging
 import re
 import socket
 from datetime import datetime, timezone
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urljoin, urlparse
 
 import httpx
 import trafilatura
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl
 
-# ============================================================
-# Google News resolver
-# IMPORTANT: gnews_resolver.py is inside scraper/
-# ============================================================
+# IMPORTANT:
+# gnews_resolver.py is inside scraper/
 from scraper.gnews_resolver import resolve_google_news as gnews_resolve
 
 
 # ============================================================
-# Logging
+# LOGGING
 # ============================================================
 
 logging.basicConfig(
@@ -30,17 +30,17 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
-logger = logging.getLogger("app")
+logger = logging.getLogger("news-byte")
 
 
 # ============================================================
-# FastAPI
+# FASTAPI
 # ============================================================
 
 app = FastAPI(
     title="NEWS BYTE Source Extractor",
-    description="Non-AI source article + site-structure extraction service.",
-    version="1.5.1",
+    description="Article extraction and Google News URL resolution API.",
+    version="1.6.0",
 )
 
 app.add_middleware(
@@ -53,118 +53,92 @@ app.add_middleware(
 
 
 # ============================================================
-# Configuration
+# CONSTANTS
 # ============================================================
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/149.0.0.0 Safari/537.36 NEWS-BYTE/1.0"
+    "Chrome/149.0.0.0 Safari/537.36"
 )
 
-MAX_DOWNLOAD_BYTES = 8_000_000
+MAX_HTML_BYTES = 8_000_000
+MAX_IMAGE_BYTES = 8_000_000
 MIN_GOOD_WORDS = 120
 MIN_GOOD_SCORE = 0.30
 
 
 # ============================================================
-# Google News helpers
-# ============================================================
-
-def is_google_news_article_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-        host = (parsed.hostname or "").lower()
-        path = parsed.path or ""
-
-        return host == "news.google.com" and (
-            path.startswith("/rss/articles/")
-            or path.startswith("/articles/")
-            or path.startswith("/read/")
-        )
-    except Exception:
-        return False
-
-
-async def resolve_google_news_url(url: str):
-    """
-    Resolve Google News article URLs.
-
-    Returns:
-        (resolved_url, method)
-    """
-
-    if not is_google_news_article_url(url):
-        return url, None
-
-    try:
-        resolved, method = await gnews_resolve(url)
-
-        logger.info(
-            "Google News resolve: %s -> %s (%s)",
-            url[:120],
-            resolved[:120] if resolved else None,
-            method,
-        )
-
-        if resolved and resolved != url:
-            return resolved, method or "resolver"
-
-        return url, method or "not-resolved"
-
-    except Exception as exc:
-        logger.exception("Google News resolver failed")
-
-        return url, f"resolver-error:{type(exc).__name__}"
-
-
-# ============================================================
-# Pydantic models
+# REQUEST MODELS
 # ============================================================
 
 class ExtractRequest(BaseModel):
     url: HttpUrl
     render: bool = False
-    max_chars: int = 60000
+    max_chars: int = Field(
+        default=60000,
+        ge=1000,
+        le=100000,
+    )
 
 
 class ExploreRequest(BaseModel):
     url: HttpUrl
-    max_pages: int = 24
-    max_depth: int = 1
-    concurrency: int = 8
+    max_pages: int = Field(
+        default=24,
+        ge=1,
+        le=100,
+    )
+    max_depth: int = Field(
+        default=1,
+        ge=0,
+        le=5,
+    )
+    concurrency: int = Field(
+        default=8,
+        ge=1,
+        le=12,
+    )
 
 
 # ============================================================
-# SSRF protection
+# URL / SSRF PROTECTION
 # ============================================================
 
 def is_public_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
 
-        if parsed.scheme not in ("http", "https"):
+        if parsed.scheme not in {"http", "https"}:
             return False
 
-        if not parsed.hostname:
+        hostname = parsed.hostname
+
+        if not hostname:
             return False
 
-        host = parsed.hostname.lower().rstrip(".")
+        hostname = hostname.lower().rstrip(".")
 
-        if host in {
+        if hostname in {
             "localhost",
+            "localhost.localdomain",
             "127.0.0.1",
             "::1",
         }:
             return False
 
-        if host.endswith(".local"):
+        if hostname.endswith(".local"):
             return False
 
-        addresses = socket.getaddrinfo(host, None)
+        addresses = socket.getaddrinfo(
+            hostname,
+            None,
+        )
 
         for info in addresses:
-            ip = ipaddress.ip_address(info[4][0])
+            ip = ipaddress.ip_address(
+                info[4][0]
+            )
 
             if (
                 ip.is_private
@@ -182,102 +156,131 @@ def is_public_url(url: str) -> bool:
 
 
 # ============================================================
-# Text cleaning
+# GOOGLE NEWS
 # ============================================================
 
-def clean(value: str) -> str:
-    return re.sub(r"\s+", " ", value or "").strip()
+def is_google_news_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
 
+        host = (
+            parsed.hostname or ""
+        ).lower().rstrip(".")
+
+        path = parsed.path.rstrip("/")
+
+        return (
+            host == "news.google.com"
+            and (
+                path.startswith(
+                    "/rss/articles/"
+                )
+                or path.startswith(
+                    "/articles/"
+                )
+                or path.startswith(
+                    "/read/"
+                )
+            )
+        )
+
+    except Exception:
+        return False
+
+
+async def resolve_google_news_url(
+    url: str,
+) -> tuple[str | None, str | None]:
+    """
+    Resolve Google News URLs.
+
+    IMPORTANT:
+    A failed Google News resolution returns None.
+    We never pretend the original Google News URL was resolved.
+    """
+
+    if not is_google_news_url(url):
+        return url, "n/a"
+
+    try:
+        resolved, method = await gnews_resolve(url)
+
+        logger.info(
+            "Google News resolve | method=%s | input=%s | output=%s",
+            method,
+            url,
+            resolved,
+        )
+
+        if resolved:
+            return resolved, method
+
+        return None, method
+
+    except Exception as exc:
+        logger.exception(
+            "Google News resolver crashed"
+        )
+
+        return None, (
+            f"resolver-exception:"
+            f"{type(exc).__name__}"
+        )
+
+
+# ============================================================
+# TEXT CLEANING
+# ============================================================
 
 _BOILERPLATE_PATTERNS = [
-    re.compile(p, re.IGNORECASE)
-    for p in (
+    re.compile(pattern, re.I)
+    for pattern in (
         r"^(also|must)\s+(read|watch|see)\b",
         r"\bclick here\b",
         r"^read more\b",
-        r"\bfollow (us|npr|ndtv)?\s*on\s+(twitter|facebook|instagram|whatsapp|telegram|x)\b",
+        r"\bfollow us\b",
         r"\bdownload (the|our)\s+app\b",
-        r"\bsubscribe to\b.*(newsletter|channel|premium)",
-        r"\bsign up for\b.*newsletter",
+        r"\bsubscribe to\b",
+        r"\bsign up for\b",
         r"\bwhatsapp channel\b",
         r"^advertisement$",
         r"^sponsored\b",
         r"\ball rights reserved\b",
-        r"^copyright\s*(©|\(c\))",
-        r"\bterms (of|and)\s*(use|service|conditions)\b",
+        r"^copyright\b",
         r"\bprivacy policy\b",
         r"\bcookie(s)?\s+policy\b",
         r"\bwe use cookies\b",
         r"^disclaimer\s*:",
-        r"\bviews (expressed|are personal)\b",
-        r"^catch all the\b",
-        r"^stay updated with\b",
-        r"this (story|article)\s+(has not been edited|is auto-generated)",
-        r"^share (this|via|on)\b",
-        r"^(photo gallery|view all images|in pictures)\b",
-        r"^trending (news|now|stories)\b",
-        r"^(watch|must watch)\s*[:\-]",
+        r"^share\b",
+        r"^photo gallery\b",
+        r"^view all images\b",
+        r"^in pictures\b",
+        r"^trending\b",
         r"^loading\.{2,3}$",
         r"\benable javascript\b",
-        r"^\(?(reuters|ap|pti|ani|afp)\)?\s*[-—]\s*$",
-        r"^\d+\s+(shares?|comments?|min read)$",
         r"^tags?\s*:",
-        r"^published\s*:",
-        r"^updated\s*:",
-        r"^image\s*(credit|source)\s*:",
     )
 ]
 
 
-def is_boilerplate(paragraph: str) -> bool:
-    text = paragraph.strip()
+def clean(value: str | None) -> str:
+    return re.sub(
+        r"\s+",
+        " ",
+        value or "",
+    ).strip()
+
+
+def is_boilerplate(text: str) -> bool:
+    text = text.strip()
 
     if not text:
         return True
 
-    if len(text) <= 60 and text.isupper():
-        return True
-
-    return any(pattern.search(text) for pattern in _BOILERPLATE_PATTERNS)
-
-
-def clean_title(title: str, url: str) -> str:
-    if not title:
-        return title
-
-    try:
-        domain = (urlparse(url).hostname or "").lower()
-        domain_core = re.sub(r"^www\.", "", domain).split(".")[0]
-    except Exception:
-        domain_core = ""
-
-    for sep in (" | ", " — ", " – ", " - "):
-        if sep not in title:
-            continue
-
-        head, _, tail = title.rpartition(sep)
-
-        head = head.strip()
-        tail = tail.strip()
-
-        if not head or not tail:
-            continue
-
-        tail_key = re.sub(r"[^a-z0-9]", "", tail.lower())
-
-        looks_like_site_name = len(tail.split()) <= 5 and (
-            (
-                domain_core
-                and len(domain_core) >= 3
-                and domain_core in tail_key
-            )
-            or len(tail_key) <= 24
-        )
-
-        if looks_like_site_name:
-            return head
-
-    return title
+    return any(
+        pattern.search(text)
+        for pattern in _BOILERPLATE_PATTERNS
+    )
 
 
 # ============================================================
@@ -285,30 +288,35 @@ def clean_title(title: str, url: str) -> str:
 # ============================================================
 
 def parse_jsonld(html: str) -> dict:
-    found = {}
-
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(
+        html,
+        "lxml",
+    )
 
     for script in soup.find_all(
         "script",
-        attrs={"type": "application/ld+json"},
+        attrs={
+            "type": "application/ld+json"
+        },
     ):
-        raw = script.string or script.get_text()
+        raw = (
+            script.string
+            or script.get_text()
+        )
 
         if not raw:
             continue
 
         try:
-            obj = json.loads(raw)
+            obj = __import__(
+                "json"
+            ).loads(raw)
         except Exception:
             continue
 
         candidates = []
 
-        if isinstance(obj, list):
-            candidates.extend(obj)
-
-        elif isinstance(obj, dict):
+        if isinstance(obj, dict):
             candidates.append(obj)
 
             graph = obj.get("@graph")
@@ -316,68 +324,100 @@ def parse_jsonld(html: str) -> dict:
             if isinstance(graph, list):
                 candidates.extend(graph)
 
+        elif isinstance(obj, list):
+            candidates.extend(obj)
+
         for item in candidates:
             if not isinstance(item, dict):
                 continue
 
-            typ = item.get("@type", "")
-            types = typ if isinstance(typ, list) else [typ]
+            article_body = item.get(
+                "articleBody"
+            )
 
-            is_article = (
-                any(
+            typ = item.get(
+                "@type",
+                "",
+            )
+
+            types = (
+                typ
+                if isinstance(typ, list)
+                else [typ]
+            )
+
+            if not (
+                isinstance(
+                    article_body,
+                    str,
+                )
+                or any(
                     str(t).lower()
                     in {
-                        "newsarticle",
                         "article",
+                        "newsarticle",
                         "report",
                         "blogposting",
                     }
                     for t in types
                 )
-                or isinstance(item.get("articleBody"), str)
-            )
-
-            if not is_article:
+            ):
                 continue
 
-            for key in (
-                "headline",
-                "articleBody",
-                "datePublished",
-                "dateModified",
-                "description",
-                "image",
-                "author",
-                "publisher",
-            ):
-                if key in item:
-                    found[key] = item[key]
+            return item
 
-            return found
-
-    return found
+    return {}
 
 
 # ============================================================
-# Metadata
+# METADATA
 # ============================================================
 
-def extract_metadata(html: str, url: str) -> dict:
-    soup = BeautifulSoup(html, "lxml")
+def extract_metadata(
+    html: str,
+    url: str,
+) -> dict:
+
+    soup = BeautifulSoup(
+        html,
+        "lxml",
+    )
+
     jsonld = parse_jsonld(html)
 
-    def meta(*pairs):
-        for attr, value in pairs:
-            tag = soup.find("meta", attrs={attr: value})
+    def get_meta(
+        *pairs: tuple[str, str],
+    ) -> str:
 
-            if tag and tag.get("content"):
-                return clean(tag["content"])
+        for attr, value in pairs:
+            tag = soup.find(
+                "meta",
+                attrs={
+                    attr: value
+                },
+            )
+
+            if tag and tag.get(
+                "content"
+            ):
+                return clean(
+                    tag.get(
+                        "content"
+                    )
+                )
 
         return ""
 
     title = (
-        clean(jsonld.get("headline", ""))
-        or meta(
+        clean(
+            str(
+                jsonld.get(
+                    "headline",
+                    "",
+                )
+            )
+        )
+        or get_meta(
             ("property", "og:title"),
             ("name", "twitter:title"),
         )
@@ -387,189 +427,180 @@ def extract_metadata(html: str, url: str) -> dict:
         h1 = soup.find("h1")
 
         if h1:
-            title = clean(h1.get_text(" ", strip=True))
+            title = clean(
+                h1.get_text(
+                    " ",
+                    strip=True,
+                )
+            )
 
     if not title and soup.title:
-        title = clean(soup.title.get_text(" ", strip=True))
+        title = clean(
+            soup.title.get_text(
+                " ",
+                strip=True,
+            )
+        )
 
     description = (
-        clean(jsonld.get("description", ""))
-        or meta(
+        clean(
+            str(
+                jsonld.get(
+                    "description",
+                    "",
+                )
+            )
+        )
+        or get_meta(
             ("property", "og:description"),
             ("name", "description"),
             ("name", "twitter:description"),
         )
     )
 
-    def image_candidate(value):
-        if isinstance(value, str):
-            value = value.strip()
+    image = ""
 
-            if not value:
-                return ""
+    jsonld_image = jsonld.get(
+        "image"
+    )
 
-            if value.startswith("//"):
-                value = "https:" + value
+    if isinstance(
+        jsonld_image,
+        str,
+    ):
+        image = jsonld_image
 
-            resolved = urljoin(url, value)
+    elif isinstance(
+        jsonld_image,
+        dict,
+    ):
+        image = (
+            jsonld_image.get(
+                "url"
+            )
+            or jsonld_image.get(
+                "contentUrl"
+            )
+            or ""
+        )
 
-            if (
-                re.match(r"^https?://", resolved, re.I)
-                and "news.google.com" not in resolved.lower()
+    elif isinstance(
+        jsonld_image,
+        list,
+    ):
+        for item in jsonld_image:
+            if isinstance(
+                item,
+                str,
             ):
-                return resolved
+                image = item
+                break
 
-        elif isinstance(value, dict):
-            for key in (
-                "url",
-                "contentUrl",
-                "thumbnailUrl",
+            if isinstance(
+                item,
+                dict,
             ):
-                result = image_candidate(value.get(key))
+                image = (
+                    item.get("url")
+                    or item.get(
+                        "contentUrl"
+                    )
+                    or ""
+                )
 
-                if result:
-                    return result
-
-        elif isinstance(value, list):
-            for item in value:
-                result = image_candidate(item)
-
-                if result:
-                    return result
-
-        return ""
+                if image:
+                    break
 
     image = (
-        image_candidate(jsonld.get("image"))
-        or meta(
+        image
+        or get_meta(
             ("property", "og:image"),
             ("property", "og:image:url"),
             ("property", "og:image:secure_url"),
-            ("name", "og:image"),
             ("name", "twitter:image"),
             ("name", "twitter:image:src"),
         )
     )
 
-    image = image_candidate(image)
-
-    if not image:
-        link_img = soup.find(
-            "link",
-            attrs={
-                "rel": re.compile(
-                    r"(^|\s)image_src(\s|$)",
-                    re.I,
-                )
-            },
+    if image:
+        image = urljoin(
+            url,
+            image,
         )
-
-        if link_img:
-            image = image_candidate(
-                link_img.get("href", "")
-            )
-
-    if not image:
-        images = []
-
-        for tag in soup.find_all("img"):
-            classes = " ".join(tag.get("class", []))
-
-            marker = " ".join(
-                [
-                    str(tag.get("alt", "")),
-                    classes,
-                    str(tag.get("id", "")),
-                    str(tag.get("data-testid", "")),
-                ]
-            ).lower()
-
-            if any(
-                x in marker
-                for x in (
-                    "logo",
-                    "avatar",
-                    "icon",
-                    "author",
-                    "profile",
-                    "social",
-                )
-            ):
-                continue
-
-            candidates = [
-                tag.get("src"),
-                tag.get("data-src"),
-                tag.get("data-original"),
-                tag.get("data-lazy-src"),
-                tag.get("data-image"),
-                tag.get("data-url"),
-            ]
-
-            srcset = (
-                tag.get("srcset")
-                or tag.get("data-srcset")
-            )
-
-            if srcset:
-                candidates.append(
-                    srcset.split(",")[-1]
-                    .strip()
-                    .split(" ")[0]
-                )
-
-            for candidate in candidates:
-                result = image_candidate(candidate)
-
-                if result:
-                    images.append(result)
-                    break
-
-        if images:
-            image = images[0]
-
-    if image and "news.google.com" in image.lower():
-        image = ""
 
     author = ""
 
-    author_data = jsonld.get("author", "")
+    author_data = jsonld.get(
+        "author"
+    )
 
-    if isinstance(author_data, dict):
+    if isinstance(
+        author_data,
+        dict,
+    ):
         author = clean(
-            str(author_data.get("name", ""))
+            str(
+                author_data.get(
+                    "name",
+                    "",
+                )
+            )
         )
 
-    elif isinstance(author_data, list):
-        names = []
+    elif isinstance(
+        author_data,
+        list,
+    ):
+        authors = []
 
-        for author_item in author_data:
-            if isinstance(author_item, dict):
-                names.append(
-                    clean(
-                        str(
-                            author_item.get(
-                                "name",
-                                "",
-                            )
+        for item in author_data:
+            if isinstance(
+                item,
+                dict,
+            ):
+                name = clean(
+                    str(
+                        item.get(
+                            "name",
+                            "",
                         )
                     )
                 )
 
-            elif isinstance(author_item, str):
-                names.append(clean(author_item))
+                if name:
+                    authors.append(
+                        name
+                    )
+
+            elif isinstance(
+                item,
+                str,
+            ):
+                authors.append(
+                    clean(item)
+                )
 
         author = ", ".join(
-            x for x in names if x
+            x
+            for x in authors
+            if x
         )
 
     elif author_data:
-        author = clean(str(author_data))
+        author = clean(
+            str(author_data)
+        )
 
     published = clean(
         str(
-            jsonld.get("datePublished", "")
-            or jsonld.get("dateModified", "")
+            jsonld.get(
+                "datePublished",
+                "",
+            )
+            or jsonld.get(
+                "dateModified",
+                "",
+            )
         )
     )
 
@@ -584,7 +615,7 @@ def extract_metadata(html: str, url: str) -> dict:
 
 
 # ============================================================
-# Article extraction
+# ARTICLE EXTRACTION
 # ============================================================
 
 def extract_article(
@@ -593,12 +624,15 @@ def extract_article(
     method: str,
 ) -> dict:
 
-    meta = extract_metadata(html, url)
+    metadata = extract_metadata(
+        html,
+        url,
+    )
 
-    data = {}
+    extracted = {}
 
     try:
-        doc = trafilatura.bare_extraction(
+        result = trafilatura.bare_extraction(
             html,
             url=url,
             include_comments=False,
@@ -609,152 +643,145 @@ def extract_article(
             with_metadata=True,
         )
 
-        if doc is not None:
-            if hasattr(doc, "as_dict"):
-                data = doc.as_dict() or {}
+        if result is not None:
 
-            elif isinstance(doc, dict):
-                data = doc
-
-            else:
-                data = {
-                    "text": getattr(doc, "text", "") or "",
-                    "title": getattr(doc, "title", "") or "",
-                    "author": getattr(doc, "author", "") or "",
-                    "date": getattr(doc, "date", "") or "",
-                    "image": getattr(doc, "image", "") or "",
-                }
-
-    except Exception:
-        logger.exception("Trafilatura bare_extraction failed")
-
-    if not data.get("text"):
-        try:
-            plain = trafilatura.extract(
-                html,
-                url=url,
-                include_comments=False,
-                include_tables=True,
-                include_links=False,
-                favor_precision=False,
-                favor_recall=True,
-                output_format="txt",
-            )
-
-            if plain:
-                data["text"] = plain
-
-        except Exception:
-            logger.exception("Trafilatura extract failed")
-
-    text = clean(data.get("text", ""))
-
-    title = (
-        clean(data.get("title", ""))
-        or meta["title"]
-    )
-
-    author = (
-        clean(data.get("author", ""))
-        or meta["author"]
-    )
-
-    published = (
-        clean(data.get("date", ""))
-        or meta["published"]
-    )
-
-    image = (
-        clean(data.get("image", ""))
-        or meta["image"]
-    )
-
-    # JSON-LD articleBody fallback
-    body = meta["jsonld"].get("articleBody")
-
-    if isinstance(body, str) and len(body) > len(text):
-        text = clean(body)
-        method += "+jsonld"
-
-    # DOM fallback
-    if len(text.split()) < MIN_GOOD_WORDS:
-        try:
-            soup = BeautifulSoup(html, "lxml")
-
-            candidates = []
-
-            selectors = (
-                "article",
-                "main",
-                "[role='main']",
-                "[itemprop='articleBody']",
-                ".article-body",
-                ".article-content",
-                ".story-body",
-                ".story-content",
-                ".entry-content",
-                ".post-content",
-                ".article__body",
-            )
-
-            for selector in selectors:
-                for node in soup.select(selector):
-                    parts = []
-
-                    for p in node.find_all(
-                        ["p", "h2", "h3"]
-                    ):
-                        paragraph = clean(
-                            p.get_text(
-                                " ",
-                                strip=True,
-                            )
-                        )
-
-                        if 45 <= len(paragraph) <= 3000:
-                            parts.append(paragraph)
-
-                    if parts:
-                        candidates.append(
-                            "\n".join(parts)
-                        )
-
-            if candidates:
-                dom_text = max(
-                    candidates,
-                    key=len,
+            if hasattr(
+                result,
+                "as_dict",
+            ):
+                extracted = (
+                    result.as_dict()
+                    or {}
                 )
 
-                if len(dom_text) > len(text):
-                    text = dom_text
-                    method += "+dom"
+            elif isinstance(
+                result,
+                dict,
+            ):
+                extracted = result
 
-        except Exception:
-            logger.exception(
-                "DOM article extraction failed"
+    except Exception:
+        logger.exception(
+            "trafilatura.bare_extraction failed"
+        )
+
+    text = clean(
+        extracted.get(
+            "text",
+            "",
+        )
+    )
+
+    # JSON-LD articleBody fallback.
+    article_body = metadata[
+        "jsonld"
+    ].get(
+        "articleBody"
+    )
+
+    if (
+        isinstance(
+            article_body,
+            str,
+        )
+        and len(article_body)
+        > len(text)
+    ):
+        text = clean(
+            article_body
+        )
+        method += "+jsonld"
+
+    # DOM fallback.
+    if len(
+        text.split()
+    ) < MIN_GOOD_WORDS:
+
+        soup = BeautifulSoup(
+            html,
+            "lxml",
+        )
+
+        candidates = []
+
+        for selector in (
+            "article",
+            "main",
+            "[role='main']",
+            "[itemprop='articleBody']",
+            ".article-body",
+            ".article-content",
+            ".story-body",
+            ".story-content",
+            ".entry-content",
+            ".post-content",
+        ):
+
+            for node in soup.select(
+                selector
+            ):
+
+                paragraphs = []
+
+                for p in node.find_all(
+                    [
+                        "p",
+                        "h2",
+                        "h3",
+                    ]
+                ):
+
+                    paragraph = clean(
+                        p.get_text(
+                            " ",
+                            strip=True,
+                        )
+                    )
+
+                    if (
+                        len(paragraph)
+                        >= 40
+                        and not is_boilerplate(
+                            paragraph
+                        )
+                    ):
+                        paragraphs.append(
+                            paragraph
+                        )
+
+                if paragraphs:
+                    candidates.append(
+                        "\n\n".join(
+                            paragraphs
+                        )
+                    )
+
+        if candidates:
+            dom_text = max(
+                candidates,
+                key=len,
             )
 
-    # Clean paragraphs
+            if len(dom_text) > len(text):
+                text = dom_text
+                method += "+dom"
+
     paragraphs = []
     seen = set()
-    junk_dropped = 0
-
-    raw_text = (
-        data.get("text", "")
-        or text
-    )
 
     for raw in re.split(
         r"\n+",
-        raw_text,
+        text,
     ):
+
         paragraph = clean(raw)
 
         if len(paragraph) < 40:
             continue
 
-        if is_boilerplate(paragraph):
-            junk_dropped += 1
+        if is_boilerplate(
+            paragraph
+        ):
             continue
 
         key = re.sub(
@@ -767,67 +794,82 @@ def extract_article(
             continue
 
         seen.add(key)
-        paragraphs.append(paragraph)
+        paragraphs.append(
+            paragraph
+        )
 
     if paragraphs:
-        text = "\n\n".join(paragraphs)
+        text = "\n\n".join(
+            paragraphs
+        )
 
-    title = clean_title(
-        title,
-        url,
+    words = len(
+        text.split()
     )
 
-    words = len(text.split())
-
-    word_score = min(
+    score = min(
         1.0,
         words / 900,
     )
 
-    paragraph_score = min(
-        1.0,
-        len(paragraphs) / 10,
-    )
-
-    junk_ratio = (
-        junk_dropped
-        / max(
-            1,
-            junk_dropped + len(paragraphs),
+    if paragraphs:
+        score = min(
+            1.0,
+            score
+            + min(
+                0.25,
+                len(paragraphs)
+                / 40,
+            ),
         )
-    )
-
-    quality = max(
-        0.0,
-        (
-            0.65 * word_score
-            + 0.35 * paragraph_score
-        )
-        - 0.4 * junk_ratio,
-    )
-
-    description = (
-        meta["description"]
-        or (
-            paragraphs[0][:280]
-            if paragraphs
-            else ""
-        )
-    )
 
     return {
         "ok": bool(text),
         "url": url,
-        "title": title,
-        "author": author,
-        "published": published,
-        "image": image,
-        "description": description,
+        "title": (
+            clean(
+                extracted.get(
+                    "title",
+                    "",
+                )
+            )
+            or metadata["title"]
+        ),
+        "description": (
+            metadata["description"]
+        ),
+        "author": (
+            clean(
+                extracted.get(
+                    "author",
+                    "",
+                )
+            )
+            or metadata["author"]
+        ),
+        "published": (
+            clean(
+                extracted.get(
+                    "date",
+                    "",
+                )
+            )
+            or metadata["published"]
+        ),
+        "image": (
+            clean(
+                extracted.get(
+                    "image",
+                    "",
+                )
+            )
+            or metadata["image"]
+        ),
         "text": text,
         "paragraphs": paragraphs,
         "word_count": words,
         "extraction_score": round(
-            quality,
+            score,
             3,
         ),
         "method": method,
@@ -838,22 +880,29 @@ def extract_article(
 
 
 # ============================================================
-# HTTP fetch
+# HTTP FETCH
 # ============================================================
 
-async def fetch_html(url: str):
+async def fetch_html(
+    url: str,
+) -> tuple[str, str]:
+
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": (
-            "text/html,application/xhtml+xml,"
+            "text/html,"
+            "application/xhtml+xml,"
             "application/xml;q=0.9,"
-            "image/avif,image/webp,*/*;q=0.8"
+            "*/*;q=0.8"
         ),
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Language": (
+            "en-US,en;q=0.9"
+        ),
+        "Cache-Control": "no-cache",
     }
 
     timeout = httpx.Timeout(
-        20.0,
+        25.0,
         connect=10.0,
     )
 
@@ -872,56 +921,74 @@ async def fetch_html(url: str):
             response.raise_for_status()
 
             content_type = (
-                response.headers
-                .get("content-type", "")
-                .lower()
+                response.headers.get(
+                    "content-type",
+                    "",
+                ).lower()
             )
 
             if (
-                "html" not in content_type
-                and "xml" not in content_type
+                "html"
+                not in content_type
+                and "xml"
+                not in content_type
             ):
                 raise ValueError(
-                    "Source response is not HTML"
+                    "Response is not HTML"
                 )
 
             chunks = []
             total = 0
 
             async for chunk in response.aiter_bytes():
+
                 total += len(chunk)
 
-                if total > MAX_DOWNLOAD_BYTES:
+                if (
+                    total
+                    > MAX_HTML_BYTES
+                ):
                     raise ValueError(
-                        "Source HTML is too large"
+                        "HTML response too large"
                     )
 
                 chunks.append(chunk)
 
-            html = b"".join(chunks).decode(
-                response.encoding or "utf-8",
+            raw = b"".join(
+                chunks
+            )
+
+            encoding = (
+                response.encoding
+                or "utf-8"
+            )
+
+            html = raw.decode(
+                encoding,
                 errors="replace",
             )
 
-            return html, str(response.url)
+            return (
+                html,
+                str(response.url),
+            )
 
 
 # ============================================================
-# Playwright fetch
+# PLAYWRIGHT FALLBACK
 # ============================================================
 
-async def fetch_rendered(url: str):
-    try:
-        from playwright.async_api import (
-            async_playwright,
-        )
-    except ImportError as exc:
-        raise RuntimeError(
-            "Playwright is not installed"
-        ) from exc
+async def fetch_rendered(
+    url: str,
+) -> tuple[str, str]:
 
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(
+    from playwright.async_api import (
+        async_playwright,
+    )
+
+    async with async_playwright() as p:
+
+        browser = await p.chromium.launch(
             headless=True,
             args=[
                 "--no-sandbox",
@@ -939,19 +1006,16 @@ async def fetch_rendered(url: str):
         )
 
         try:
+
             await page.goto(
                 url,
                 wait_until="domcontentloaded",
                 timeout=30000,
             )
 
-            await page.wait_for_timeout(1500)
-
-            await page.evaluate(
-                "window.scrollTo(0, document.body.scrollHeight * 0.70)"
+            await page.wait_for_timeout(
+                1500
             )
-
-            await page.wait_for_timeout(900)
 
             return (
                 await page.content(),
@@ -963,16 +1027,18 @@ async def fetch_rendered(url: str):
 
 
 # ============================================================
-# Single article extraction
+# SINGLE ARTICLE
 # ============================================================
 
 async def extract_one(
-    url: str,
+    requested_url: str,
     render: bool,
     max_chars: int,
-):
+) -> dict:
 
-    if not is_public_url(url):
+    if not is_public_url(
+        requested_url
+    ):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -983,63 +1049,118 @@ async def extract_one(
 
     errors = []
 
-    requested_url = url
-    last_result = None
+    original_url = requested_url
+    resolved_url = requested_url
+    google_method = "n/a"
 
     # --------------------------------------------------------
-    # Google News resolver
+    # GOOGLE NEWS RESOLUTION
     # --------------------------------------------------------
 
-    resolved_url, resolve_method = (
-        await resolve_google_news_url(url)
-    )
-
-    url = resolved_url
-
-    if (
-        resolve_method
-        and resolve_method
-        not in (
-            "cache",
-            "not-resolved",
-        )
+    if is_google_news_url(
+        requested_url
     ):
-        errors.append(
-            "google-resolve:"
-            + str(resolve_method)
+
+        resolved_url, google_method = (
+            await resolve_google_news_url(
+                requested_url
+            )
         )
 
-        # Only fail here when resolver explicitly
-        # failed and URL is still Google News.
-        if is_google_news_article_url(url):
+        # CRITICAL:
+        # Never continue to the extractor with an
+        # unresolved Google News URL.
+        if not resolved_url:
+
             return {
                 "ok": False,
                 "url": requested_url,
                 "requested_url": requested_url,
-                "resolved_url": url,
-                "google_resolve": resolve_method,
+                "resolved_url": None,
+                "google_resolve": google_method,
                 "title": "",
+                "description": "",
                 "author": "",
                 "published": "",
                 "image": "",
-                "description": "",
                 "text": "",
                 "paragraphs": [],
                 "word_count": 0,
                 "extraction_score": 0,
                 "method": "google-resolve-failed",
-                "errors": errors,
+                "errors": [
+                    "Google News URL could not be resolved"
+                ],
+                "fetched_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+            }
+
+        if is_google_news_url(
+            resolved_url
+        ):
+            return {
+                "ok": False,
+                "url": requested_url,
+                "requested_url": requested_url,
+                "resolved_url": resolved_url,
+                "google_resolve": google_method,
+                "title": "",
+                "description": "",
+                "author": "",
+                "published": "",
+                "image": "",
+                "text": "",
+                "paragraphs": [],
+                "word_count": 0,
+                "extraction_score": 0,
+                "method": "google-resolve-invalid",
+                "errors": [
+                    "Resolver returned another Google News URL"
+                ],
+                "fetched_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+            }
+
+        if not is_public_url(
+            resolved_url
+        ):
+            return {
+                "ok": False,
+                "url": requested_url,
+                "requested_url": requested_url,
+                "resolved_url": resolved_url,
+                "google_resolve": google_method,
+                "title": "",
+                "description": "",
+                "author": "",
+                "published": "",
+                "image": "",
+                "text": "",
+                "paragraphs": [],
+                "word_count": 0,
+                "extraction_score": 0,
+                "method": "google-resolve-invalid",
+                "errors": [
+                    "Resolved URL is not a public URL"
+                ],
                 "fetched_at": datetime.now(
                     timezone.utc
                 ).isoformat(),
             }
 
     # --------------------------------------------------------
-    # Fast HTTP extraction
+    # NORMAL HTTP EXTRACTION
     # --------------------------------------------------------
 
     try:
-        html, final_url = await fetch_html(url)
+
+        html, final_url = (
+            await fetch_html(
+                resolved_url
+            )
+        )
 
         result = extract_article(
             html,
@@ -1047,42 +1168,52 @@ async def extract_one(
             "http+trafilatura",
         )
 
-        result["requested_url"] = requested_url
-        result["resolved_url"] = final_url
-        result["google_resolve"] = resolve_method
-
-        last_result = result
+        result.update(
+            {
+                "requested_url": original_url,
+                "resolved_url": final_url,
+                "google_resolve": google_method,
+                "errors": errors,
+            }
+        )
 
         if (
             result["word_count"]
             >= MIN_GOOD_WORDS
-            and result["extraction_score"]
+            and result[
+                "extraction_score"
+            ]
             >= MIN_GOOD_SCORE
         ):
-            result["text"] = result[
-                "text"
-            ][:max_chars]
+
+            result["text"] = (
+                result["text"][:max_chars]
+            )
 
             return result
 
     except Exception as exc:
+
         logger.exception(
             "HTTP extraction failed"
         )
 
         errors.append(
-            "http:"
-            + type(exc).__name__
+            f"http:{type(exc).__name__}"
         )
 
     # --------------------------------------------------------
-    # Playwright fallback
+    # RENDERED FALLBACK
     # --------------------------------------------------------
 
     if render:
+
         try:
+
             html, final_url = (
-                await fetch_rendered(url)
+                await fetch_rendered(
+                    resolved_url
+                )
             )
 
             result = extract_article(
@@ -1091,68 +1222,46 @@ async def extract_one(
                 "playwright+trafilatura",
             )
 
-            result["requested_url"] = requested_url
-            result["resolved_url"] = final_url
-            result["google_resolve"] = resolve_method
+            result.update(
+                {
+                    "requested_url": original_url,
+                    "resolved_url": final_url,
+                    "google_resolve": google_method,
+                    "errors": errors,
+                }
+            )
 
-            if result["ok"]:
-                result["text"] = result[
-                    "text"
-                ][:max_chars]
+            result["text"] = (
+                result["text"][:max_chars]
+            )
 
-                return result
+            return result
 
         except Exception as exc:
+
             logger.exception(
                 "Playwright extraction failed"
             )
 
             errors.append(
-                "render:"
-                + type(exc).__name__
+                f"render:{type(exc).__name__}"
             )
 
     # --------------------------------------------------------
-    # Low-quality HTTP result
-    # --------------------------------------------------------
-
-    if last_result:
-        last_result["ok"] = False
-
-        last_result["method"] = (
-            last_result.get(
-                "method",
-                "failed",
-            )
-            + "+low-quality"
-        )
-
-        last_result["errors"] = errors
-
-        last_result["text"] = (
-            last_result.get(
-                "text",
-                "",
-            )[:max_chars]
-        )
-
-        return last_result
-
-    # --------------------------------------------------------
-    # Complete failure
+    # FINAL FAILURE
     # --------------------------------------------------------
 
     return {
         "ok": False,
-        "url": requested_url,
-        "requested_url": requested_url,
-        "resolved_url": url,
-        "google_resolve": resolve_method,
+        "url": original_url,
+        "requested_url": original_url,
+        "resolved_url": resolved_url,
+        "google_resolve": google_method,
         "title": "",
+        "description": "",
         "author": "",
         "published": "",
         "image": "",
-        "description": "",
         "text": "",
         "paragraphs": [],
         "word_count": 0,
@@ -1166,72 +1275,48 @@ async def extract_one(
 
 
 # ============================================================
-# Explore helpers
+# EXPLORE
 # ============================================================
 
-_BAD_RX = re.compile(
-    r"(^|[-_ ])("
-    r"ad|ads|advert|advertisement|banner|cookie|consent|"
-    r"subscribe|newsletter|nav|navbar|menu|footer|header|"
-    r"sidebar|related|recommended|comments?|social|share|"
-    r"promo|modal|popup|paywall|login|register|breadcrumb|"
-    r"utility|toolbar|app-promo|download-app"
-    r")([-_ ]|$)",
-    re.I,
-)
+def root_domain(
+    host: str,
+) -> str:
 
-
-def _cls_id(tag) -> str:
-    try:
-        classes = " ".join(
-            tag.get("class") or []
-        )
-    except Exception:
-        classes = ""
-
-    return (
-        f"{tag.get('id', '')} {classes}"
-    )
-
-
-def _is_boilerplate_tag(tag) -> bool:
-    return bool(
-        _BAD_RX.search(
-            _cls_id(tag)
-        )
-    )
-
-
-def root_domain(host: str) -> str:
     parts = [
         p
-        for p in (host or "").lower().split(".")
+        for p in host.lower().split(".")
         if p
     ]
 
-    if len(parts) > 2:
-        return ".".join(parts[-2:])
+    if len(parts) >= 2:
+        return ".".join(
+            parts[-2:]
+        )
 
-    return ".".join(parts)
+    return host
 
 
-def is_same_site(
+def same_site(
     href: str,
     base_host: str,
     base_root: str,
 ) -> bool:
 
     try:
-        parsed = urlparse(href)
 
-        if parsed.scheme not in (
+        parsed = urlparse(
+            href
+        )
+
+        if parsed.scheme not in {
             "http",
             "https",
-        ):
+        }:
             return False
 
         host = (
-            parsed.hostname or ""
+            parsed.hostname
+            or ""
         ).lower()
 
         return (
@@ -1245,488 +1330,6 @@ def is_same_site(
         return False
 
 
-# ============================================================
-# Structured page extraction
-# ============================================================
-
-def build_structured_page(
-    html: str,
-    url: str,
-) -> dict:
-
-    soup = BeautifulSoup(
-        html,
-        "lxml",
-    )
-
-    parsed = urlparse(url)
-
-    base_host = (
-        parsed.hostname or ""
-    ).lower()
-
-    base_root = root_domain(
-        base_host
-    )
-
-    for tag in soup.find_all(
-        [
-            "script",
-            "style",
-            "noscript",
-            "iframe",
-        ]
-    ):
-        tag.decompose()
-
-    meta = extract_metadata(
-        html,
-        url,
-    )
-
-    sections = []
-    stack = {}
-
-    def new_section(
-        text: str,
-        level: int,
-    ):
-        section = {
-            "title": text,
-            "level": level,
-            "paragraphs": [],
-            "bullets": [],
-        }
-
-        sections.append(section)
-        stack[level] = section
-
-        for lv in [
-            lv for lv in stack
-            if lv > level
-        ]:
-            del stack[lv]
-
-        return section
-
-    def current_section():
-        for level in (
-            4,
-            3,
-            2,
-            1,
-        ):
-            if level in stack:
-                return stack[level]
-
-        return None
-
-    links = []
-    pdf_links = []
-    book_links = []
-    magazine_links = []
-
-    tag_links = []
-    category_links = []
-    pagination_links = []
-
-    seen_hrefs = set()
-
-    media = []
-    seen_media = set()
-
-    current_media_section = "Other"
-
-    for el in soup.find_all(
-        [
-            "h1",
-            "h2",
-            "h3",
-            "h4",
-            "p",
-            "li",
-            "blockquote",
-            "a",
-            "img",
-        ]
-    ):
-
-        name = el.name
-
-        # ----------------------------------------------------
-        # Headings
-        # ----------------------------------------------------
-
-        if name in (
-            "h1",
-            "h2",
-            "h3",
-            "h4",
-        ):
-            text = clean(
-                el.get_text(
-                    " ",
-                    strip=True,
-                )
-            )
-
-            if not text:
-                continue
-
-            new_section(
-                text,
-                int(name[1]),
-            )
-
-            current_media_section = text
-
-            continue
-
-        # ----------------------------------------------------
-        # Text
-        # ----------------------------------------------------
-
-        if name in (
-            "p",
-            "li",
-            "blockquote",
-        ):
-
-            if _is_boilerplate_tag(el):
-                continue
-
-            text = clean(
-                el.get_text(
-                    " ",
-                    strip=True,
-                )
-            )
-
-            if not text:
-                continue
-
-            section = current_section()
-
-            if not section:
-                continue
-
-            if name == "li":
-                if len(text) >= 3:
-                    section[
-                        "bullets"
-                    ].append(text)
-
-            elif len(text) >= 25:
-                section[
-                    "paragraphs"
-                ].append(text)
-
-            continue
-
-        # ----------------------------------------------------
-        # Images
-        # ----------------------------------------------------
-
-        if name == "img":
-
-            src = (
-                el.get("src")
-                or el.get("data-src")
-                or el.get("data-lazy-src")
-                or ""
-            )
-
-            if not src:
-                continue
-
-            src = urljoin(
-                url,
-                src,
-            )
-
-            if (
-                not re.match(
-                    r"^https?://",
-                    src,
-                    re.I,
-                )
-                or src in seen_media
-            ):
-                continue
-
-            alt = clean(
-                el.get("alt", "")
-                or ""
-            )
-
-            figure = el.find_parent(
-                "figure"
-            )
-
-            caption = ""
-
-            if figure is not None:
-                caption_tag = (
-                    figure.find("figcaption")
-                )
-
-                if caption_tag:
-                    caption = clean(
-                        caption_tag.get_text(
-                            " ",
-                            strip=True,
-                        )
-                    )
-
-            hint = (
-                f"{alt} {caption} "
-                f"{' '.join(el.get('class') or [])}"
-            ).lower()
-
-            kind = (
-                "map"
-                if re.search(
-                    r"\b(map|gis|location|route|"
-                    r"roadmap|political map|india map)\b",
-                    hint,
-                )
-                else "image"
-            )
-
-            seen_media.add(src)
-
-            media.append(
-                {
-                    "src": src,
-                    "alt": alt,
-                    "caption": caption,
-                    "kind": kind,
-                    "section": current_media_section,
-                }
-            )
-
-            continue
-
-        # ----------------------------------------------------
-        # Links
-        # ----------------------------------------------------
-
-        if name == "a":
-
-            href = el.get("href") or ""
-
-            if not href:
-                continue
-
-            href = urljoin(
-                url,
-                href,
-            )
-
-            if not is_same_site(
-                href,
-                base_host,
-                base_root,
-            ):
-                continue
-
-            if _is_boilerplate_tag(el):
-                continue
-
-            link_title = (
-                clean(
-                    el.get_text(
-                        " ",
-                        strip=True,
-                    )
-                )
-                or clean(
-                    el.get(
-                        "aria-label",
-                        "",
-                    )
-                    or ""
-                )
-                or clean(
-                    el.get(
-                        "title",
-                        "",
-                    )
-                    or ""
-                )
-            )
-
-            if (
-                not link_title
-                or len(link_title) > 160
-                or href in seen_hrefs
-            ):
-                continue
-
-            seen_hrefs.add(href)
-
-            section = current_section()
-
-            item = {
-                "href": href,
-                "title": link_title,
-                "section": (
-                    section["title"]
-                    if section
-                    else "Other useful links"
-                ),
-            }
-
-            path = urlparse(
-                href
-            ).path.lower()
-
-            path_title = (
-                f"{path} {link_title}"
-            ).lower()
-
-            if (
-                re.search(
-                    r"\.pdf(?:$|[?#])",
-                    href,
-                    re.I,
-                )
-                or re.search(
-                    r"/pdf(?:/|$)",
-                    path,
-                )
-            ):
-                pdf_links.append(item)
-
-            if re.search(
-                r"\b(book|books|ebook|e-book)\b|/books?/",
-                path_title,
-            ):
-                book_links.append(item)
-
-            if re.search(
-                r"\b(magazine|magazines|monthly|edition)\b|/magazines?/",
-                path_title,
-            ):
-                magazine_links.append(item)
-
-            if re.search(
-                r"/tags?/",
-                path,
-            ):
-                tag_links.append(item)
-
-            if re.search(
-                r"/category|/categories|/subjects?|/topics?|/section",
-                path,
-            ):
-                category_links.append(item)
-
-            if (
-                re.search(
-                    r"\b(next|previous|prev|older|newer)\b",
-                    path_title,
-                )
-                or re.search(
-                    r"[?&](page|paged)=\d+",
-                    href,
-                    re.I,
-                )
-                or re.search(
-                    r"/page/\d+",
-                    path,
-                )
-            ):
-                pagination_links.append(item)
-
-            articleish = bool(
-                re.search(
-                    r"/(daily-updates|current-affairs|news|"
-                    r"editorial|article|articles|study|notes|"
-                    r"courses|analysis|magazine|books?|topics?|"
-                    r"subjects?|blog|upsc|ias|exam)",
-                    path,
-                    re.I,
-                )
-            ) or len(
-                link_title.split()
-            ) >= 4
-
-            if (
-                articleish
-                and not re.search(
-                    r"/(login|signup|register|contact|"
-                    r"privacy|terms|careers|about|search)\b",
-                    path,
-                    re.I,
-                )
-            ):
-                links.append(item)
-
-    sections = [
-        section
-        for section in sections
-        if (
-            section["paragraphs"]
-            or section["bullets"]
-        )
-    ]
-
-    if not sections:
-        paragraphs = []
-
-        for p in soup.find_all("p"):
-
-            if _is_boilerplate_tag(p):
-                continue
-
-            text = clean(
-                p.get_text(
-                    " ",
-                    strip=True,
-                )
-            )
-
-            if len(text) >= 35:
-                paragraphs.append(text)
-
-        if paragraphs:
-            sections = [
-                {
-                    "title": (
-                        meta["title"]
-                        or "Page"
-                    ),
-                    "level": 1,
-                    "paragraphs": paragraphs,
-                    "bullets": [],
-                }
-            ]
-
-    return {
-        "ok": True,
-        "url": url,
-        "pageTitle": meta["title"],
-        "description": meta["description"],
-        "author": meta["author"],
-        "date": meta["published"],
-        "sections": sections[:200],
-        "links": links[:240],
-        "pdfLinks": pdf_links[:80],
-        "bookLinks": book_links[:60],
-        "magazineLinks": magazine_links[:60],
-        "tagLinks": tag_links[:80],
-        "categoryLinks": category_links[:100],
-        "paginationLinks": pagination_links[:40],
-        "media": media[:40],
-        "heroImage": meta["image"],
-    }
-
-
-# ============================================================
-# Site crawler
-# ============================================================
-
 async def crawl_site(
     start_url: str,
     max_pages: int,
@@ -1734,7 +1337,9 @@ async def crawl_site(
     concurrency: int,
 ) -> dict:
 
-    if not is_public_url(start_url):
+    if not is_public_url(
+        start_url
+    ):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -1743,225 +1348,233 @@ async def crawl_site(
             ),
         )
 
-    max_pages = max(
-        1,
-        min(100, max_pages),
-    )
-
-    max_depth = max(
-        0,
-        min(5, max_depth),
-    )
-
-    concurrency = max(
-        1,
-        min(12, concurrency),
-    )
-
     semaphore = asyncio.Semaphore(
         concurrency
     )
 
-    async def fetch_one(url: str):
+    visited = set()
+    pages = []
+
+    async def fetch_page(
+        url: str,
+    ):
 
         async with semaphore:
+
             try:
+
                 html, final_url = (
-                    await fetch_html(url)
+                    await fetch_html(
+                        url
+                    )
                 )
 
-                return build_structured_page(
+                metadata = extract_metadata(
                     html,
                     final_url,
                 )
 
-            except Exception:
-                logger.exception(
-                    "Crawl failed: %s",
-                    url,
+                soup = BeautifulSoup(
+                    html,
+                    "lxml",
+                )
+
+                links = []
+
+                for a in soup.find_all(
+                    "a",
+                    href=True,
+                ):
+
+                    href = urljoin(
+                        final_url,
+                        a.get(
+                            "href"
+                        ),
+                    )
+
+                    title = clean(
+                        a.get_text(
+                            " ",
+                            strip=True,
+                        )
+                    )
+
+                    if (
+                        title
+                        and same_site(
+                            href,
+                            (
+                                urlparse(
+                                    final_url
+                                ).hostname
+                                or ""
+                            ).lower(),
+                            root_domain(
+                                (
+                                    urlparse(
+                                        final_url
+                                    ).hostname
+                                    or ""
+                                ).lower()
+                            ),
+                        )
+                    ):
+                        links.append(
+                            {
+                                "href": href,
+                                "title": title,
+                            }
+                        )
+
+                return {
+                    "ok": True,
+                    "url": final_url,
+                    "title": metadata[
+                        "title"
+                    ],
+                    "description": metadata[
+                        "description"
+                    ],
+                    "image": metadata[
+                        "image"
+                    ],
+                    "links": links[
+                        :200
+                    ],
+                }
+
+            except Exception as exc:
+
+                logger.warning(
+                    "Explore failed: %s",
+                    exc,
                 )
 
                 return None
 
-    seen = set()
-    all_links = []
+    frontier = [
+        start_url
+    ]
 
-    first = None
-
-    frontier = [start_url]
-    depth = 0
-
-    while (
-        frontier
-        and len(seen) < max_pages
-        and depth <= max_depth
+    for depth in range(
+        max_depth + 1
     ):
 
-        batch = []
+        if not frontier:
+            break
+
+        current = []
 
         for url in frontier:
 
-            if (
-                url not in seen
-                and len(seen) + len(batch)
-                < max_pages
-            ):
-                batch.append(url)
+            if url in visited:
+                continue
 
-        if not batch:
+            if len(
+                visited
+            ) >= max_pages:
+                break
+
+            visited.add(url)
+            current.append(url)
+
+        if not current:
             break
-
-        seen.update(batch)
 
         results = await asyncio.gather(
             *[
-                fetch_one(url)
-                for url in batch
+                fetch_page(url)
+                for url in current
             ]
         )
 
-        next_frontier = {}
+        next_frontier = []
 
-        for url, data in zip(
-            batch,
-            results,
-        ):
+        for result in results:
 
-            if not data or not data.get("ok"):
+            if not result:
                 continue
 
-            if first is None:
-                first = data
+            pages.append(
+                result
+            )
 
-            for link in data.get(
-                "links",
-                [],
-            ):
-                all_links.append(
-                    {
-                        **link,
-                        "depth": depth,
-                    }
-                )
+            if depth >= max_depth:
+                continue
 
-            if depth < max_depth:
+            for link in result[
+                "links"
+            ]:
 
-                base_host = (
-                    urlparse(url)
-                    .hostname
-                    or ""
-                ).lower()
+                href = link[
+                    "href"
+                ]
 
-                root = root_domain(
-                    base_host
-                )
-
-                for link in data.get(
-                    "links",
-                    [],
-                ):
-
-                    href = link["href"]
-
-                    host = (
-                        urlparse(href)
-                        .hostname
-                        or ""
-                    ).lower()
-
-                    if (
-                        (
-                            host == base_host
-                            or host.endswith(
-                                "." + root
-                            )
-                        )
-                        and href not in seen
-                    ):
-                        next_frontier[
-                            href
-                        ] = True
-
-                for link in (
-                    data.get(
-                        "paginationLinks"
+                if href not in visited:
+                    next_frontier.append(
+                        href
                     )
-                    or []
-                )[:4]:
-
-                    href = link["href"]
-
-                    if href not in seen:
-                        next_frontier[
-                            href
-                        ] = True
-
-        remaining = max(
-            0,
-            (max_pages - len(seen)) * 2,
-        )
 
         frontier = list(
-            next_frontier.keys()
-        )[:remaining]
+            dict.fromkeys(
+                next_frontier
+            )
+        )[:max_pages]
 
-        depth += 1
+    if not pages:
 
-    if first is None:
         return {
             "ok": False,
-            "error": (
-                "No public pages could be extracted. "
-                "The site may require sign-in or "
-                "block automated reading."
-            ),
             "url": start_url,
+            "pages": [],
+            "error": "No pages extracted",
         }
 
-    dedup = {}
+    first = pages[0]
 
-    for link in all_links:
-        dedup.setdefault(
-            link["href"],
-            link,
-        )
-
-    result = dict(first)
-
-    result["links"] = list(
-        dedup.values()
-    )[:1000]
-
-    result["crawlPages"] = len(seen)
-
-    result["crawledUrls"] = list(
-        seen
-    )
-
-    return result
+    return {
+        "ok": True,
+        "url": first["url"],
+        "pageTitle": first[
+            "title"
+        ],
+        "description": first[
+            "description"
+        ],
+        "image": first[
+            "image"
+        ],
+        "pages": pages,
+        "pageCount": len(
+            pages
+        ),
+        "crawledUrls": list(
+            visited
+        ),
+    }
 
 
 # ============================================================
-# API endpoints
+# ROUTES
 # ============================================================
 
 @app.get("/")
 async def root():
     return {
-        "service": "NEWS BYTE Source Extractor",
-        "version": "1.5.1",
-        "ai": False,
+        "service": (
+            "NEWS BYTE Source Extractor"
+        ),
+        "version": "1.6.0",
         "status": "running",
-        "usage": {
-            "extract": (
-                "POST /extract with "
-                "{url, render, max_chars}"
-            ),
-            "explore": (
-                "POST /explore with "
-                "{url, max_pages, max_depth, concurrency}"
-            ),
-        },
+        "google_news_resolver": True,
+        "endpoints": [
+            "GET /",
+            "GET /health",
+            "POST /extract",
+            "POST /explore",
+            "GET /image",
+        ],
     }
 
 
@@ -1969,8 +1582,8 @@ async def root():
 async def health():
     return {
         "ok": True,
-        "service": "news-byte-source-extractor",
-        "ai": False,
+        "status": "running",
+        "google_news_resolver": True,
     }
 
 
@@ -1979,12 +1592,11 @@ async def extract_endpoint(
     request: ExtractRequest,
 ):
     return await extract_one(
-        str(request.url),
-        request.render,
-        min(
-            max(request.max_chars, 1000),
-            100000,
+        requested_url=str(
+            request.url
         ),
+        render=request.render,
+        max_chars=request.max_chars,
     )
 
 
@@ -1993,7 +1605,9 @@ async def explore_endpoint(
     request: ExploreRequest,
 ):
     return await crawl_site(
-        str(request.url),
+        start_url=str(
+            request.url
+        ),
         max_pages=request.max_pages,
         max_depth=request.max_depth,
         concurrency=request.concurrency,
@@ -2001,9 +1615,13 @@ async def explore_endpoint(
 
 
 @app.get("/image")
-async def proxy_image(url: str):
+async def image_proxy(
+    url: str,
+):
 
-    if not is_public_url(url):
+    if not is_public_url(
+        url
+    ):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -2014,19 +1632,14 @@ async def proxy_image(url: str):
 
     headers = {
         "User-Agent": USER_AGENT,
-        "Accept": (
-            "image/avif,image/webp,"
-            "image/apng,image/svg+xml,"
-            "image/*,*/*;q=0.8"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "image/*,*/*;q=0.8",
         "Referer": url,
     }
 
     try:
 
         timeout = httpx.Timeout(
-            15.0,
+            20.0,
             connect=8.0,
         )
 
@@ -2037,14 +1650,18 @@ async def proxy_image(url: str):
             timeout=timeout,
         ) as client:
 
-            response = await client.get(url)
+            response = await client.get(
+                url
+            )
 
             response.raise_for_status()
 
             content_type = (
-                response.headers
-                .get("content-type", "")
-                .split(";", 1)[0]
+                response.headers.get(
+                    "content-type",
+                    "",
+                )
+                .split(";")[0]
                 .lower()
             )
 
@@ -2054,14 +1671,18 @@ async def proxy_image(url: str):
                 raise HTTPException(
                     status_code=415,
                     detail=(
-                        "URL did not return an image"
+                        "URL did not return "
+                        "an image"
                     ),
                 )
 
-            if len(response.content) > 8_000_000:
+            if (
+                len(response.content)
+                > MAX_IMAGE_BYTES
+            ):
                 raise HTTPException(
                     status_code=413,
-                    detail="Image is too large",
+                    detail="Image too large",
                 )
 
             return Response(
@@ -2069,8 +1690,7 @@ async def proxy_image(url: str):
                 media_type=content_type,
                 headers={
                     "Cache-Control": (
-                        "public, max-age=86400, "
-                        "stale-while-revalidate=604800"
+                        "public, max-age=86400"
                     )
                 },
             )
@@ -2079,8 +1699,9 @@ async def proxy_image(url: str):
         raise
 
     except Exception as exc:
+
         logger.exception(
-            "Image fetch failed"
+            "Image proxy failed"
         )
 
         raise HTTPException(
@@ -2093,7 +1714,7 @@ async def proxy_image(url: str):
 
 
 # ============================================================
-# Local execution
+# LOCAL DEVELOPMENT
 # ============================================================
 
 if __name__ == "__main__":
@@ -2104,3 +1725,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=7860,
     )
+```
