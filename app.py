@@ -1,79 +1,48 @@
 """
 ═══════════════════════════════════════════════════════════════════════════
- Auth-Bypass Scraper v3.4 — Cloud Run Deployable Service
+ Auth-Bypass Scraper v3.5 — Cloud Run Deployable Service
 ═══════════════════════════════════════════════════════════════════════════
 
- v3.4 changes (turns dead capability into actual bypass success, not just
- clearer failure logging — addresses reuters.com-style hard 403s where
- EVERY curl_cffi fingerprint AND both bot UAs get blocked, which is a
- network/IP-reputation-level block that no header trick alone defeats):
-   - FIXED: SOCIAL_REFERERS and ANTI_PAYWALL_COOKIES were defined in
-     scraper/bypass.py but never actually attached to any request — every
-     curl_cffi attempt went out with no Referer and no cookies at all.
-     Now each of the 4 TLS-impersonation attempts cycles through a
-     different social/search referer plus meter-reset cookies. Free to
-     try, costs nothing extra; helps meter-based paywalls specifically
-     (distinct from a hard bot-firewall block).
-   - NEW: /scrape now also runs FlareSolverr (Layer 2.5, same as
-     /pdf/direct already did) when FLARESOLVERR_URL is configured and
-     curl_cffi fails or hits a Cloudflare-style JS challenge — solves the
-     challenge instead of skipping straight to the full browser.
-   - NEW: /scrape now also runs ScraperAPI's residential-pool fetch
-     (Layer 4, same as /pdf/direct already did) when SCRAPERAPI_KEY is
-     configured and neither curl_cffi nor the stealth browser found real
-     article content. This is the layer that actually turns a hard
-     IP-reputation 403 (Reuters-style) into a 200 — no fingerprint or
-     header spoofing from this instance's own datacenter IP can do that;
-     only a different, residential IP can. Runs right before the archive
-     fallback as a last resort.
-   - Both new layers are no-ops (skipped entirely, zero overhead) when
-     their env var isn't set — behavior is unchanged for anyone not using
-     FlareSolverr/ScraperAPI.
+ v3.5 changes (fixes EMPTY results on news.google.com/rss/articles/... URLs):
+   - NEW: Layer 0 in /scrape and /pdf/direct — Google News redirect
+     resolution. news.google.com/rss/articles/CBMi...?oc=5 URLs are
+     protobuf-encoded click-tracking redirects, not article URLs. Fetching
+     them "succeeds" (HTTP 200 from news.google.com) but yields only
+     Google's JS shell — which showed up as 'curl_cffi✓' + 14-word EMPTY
+     results with no error anywhere in the chain.
+     Resolution: offline protobuf/base64 decode for old-style IDs →
+     batchexecute RPC (Fbv4je/garturlreq) with data-n-a-sg/data-n-a-ts
+     scraped from the redirect page for the new-style AU_yqL IDs that are
+     unresolvable offline (the old base64 trick died July 2024).
+     See scraper/gnews_resolver.py. Results cached (LRU, 2k), calls
+     serialized + rate-limited, proxied via PROXY_URL (batchexecute is a
+     hard 429 hotspot from datacenter IPs).
+   - NEW: /scrape + /pdf/direct responses now include resolved_url (the
+     real article URL) and original_url. /extract maps resolved_url
+     through so the extension logs the actual publisher URL.
+   - NEW: POST /gnews/resolve — standalone resolver endpoint so the
+     extension's "Google resolve" step can use this server instead of its
+     own (now-dead) offline decoder. This is what its "decoder-failed"
+     errors were: attempting offline decode on new-style AU_yqL IDs.
+   - /scrape fails fast (502) when a Google News URL can't be resolved,
+     instead of burning the full browser pipeline on Google's shell page.
 
- v3.3 changes (fixes silent/misleading bypass_chain on blocked publishers,
- e.g. reuters.com returning 0 words with just "curl_cffi✗(RuntimeError)"
- and "stealth-browser✓" and no way to tell why):
-   - FIXED: StealthBrowser never routed through PROXY_URL — only curl_cffi
-     did (scraper/bypass.py's _proxies()). A publisher that blocks/
-     challenges datacenter IPs at the network level (Reuters and similar)
-     would see one from the browser layer too, even with a residential
-     proxy configured, since the browser simply never used it.
-     launch_persistent_context() now takes a proxy= built from PROXY_URL
-     (scraper/browser.py: StealthBrowser._playwright_proxy()).
-   - FIXED: "stealth-browser✓" was logged whenever Playwright returned ANY
-     html, whether or not extract_article() found real content in it — so
-     a bot-check/consent/paywall page (valid HTML, no article) looked
-     identical to a genuine success in bypass_chain. Now logs
-     "stealth-browser⚠(loaded, no article extracted)" in that case, and
-     "stealth-browser✗(...)" if the browser returned no html at all.
-   - FIXED: curl_cffi✗ and browser✗ chain entries logged only the
-     exception's class name (always "RuntimeError" for the curl_cffi
-     layer, since bypass.py wraps every per-fingerprint failure into one
-     generic RuntimeError) and dropped the actual reason. Both now include
-     the exception's message (e.g. "HTTP 403 (chrome124)"), truncated to
-     200 chars.
-   - FIXED: the archive.ph/web.archive.org fallback failed completely
-     silently (bare `except: pass`) — no chain entry at all if it found
-     nothing or errored. Now logs archive✓ / archive⚠(fetched, no article
-     extracted) / archive✗(reason), same pattern as the other layers.
+ v3.4 changes:
+   - SOCIAL_REFERERS + ANTI_PAYWALL_COOKIES actually attached to curl_cffi
+     attempts (were defined but never sent).
+   - FlareSolverr (Layer 2.5) and ScraperAPI (Layer 4) now also run in
+     /scrape, matching /pdf/direct. Both are no-ops unless their env vars
+     are set.
 
- v3.2 changes (fixes "still not bypassed" from Cloud Run):
-   - NEW: /debug/pdf  — diagnose exactly what a CDN returns from this
-     instance's IP (status, content-type, cf-challenge detection, body head)
-   - NEW: residential-proxy routing for ALL curl_cffi fetches
-     (_cffi_proxies()) — fixes datacenter-IP challenges (AS15169 blocks)
-   - NEW: FlareSolverr fallback layer in /pdf/direct — solves Cloudflare
-     JS challenge, replays earned cf_clearance cookies on the CDN fetch
-   - NEW: ScraperAPI last-resort fallback (geo-targeted residential pool)
-   - NEW: cookie warm-up strategy — stealth-browser visit to the main
-     domain first, harvest cookies, replay on the direct CDN URL
-   - FIXED: _normalize_direct_pdf_url — leading-slash u= params
-     (u=%2Fblogmedia...) no longer produce https:/// URLs
-   - FIXED: strict %PDF magic-byte validation everywhere (fake-200s from
-     challenge pages no longer accepted as success)
-   - FIXED: contact_meta always defined on all return paths
-   - FIXED: single consolidated browser-PDF strategy (no double render)
-   - LaTeX humanization auto-applies only when formulas detected
+ v3.3 changes:
+   - StealthBrowser routes through PROXY_URL (scraper/browser.py).
+   - Honest bypass_chain entries: stealth-browser⚠(loaded, no article),
+     ✗ entries carry real exception messages, archive fallback logged.
+
+ v3.2 changes:
+   - /debug/pdf endpoint; residential-proxy routing for curl_cffi;
+     FlareSolverr + ScraperAPI fallbacks in /pdf/direct; cookie warm-up;
+     %PDF magic-byte validation; single consolidated browser-PDF strategy.
 
  Endpoints:
    POST /scrape            Full bypass pipeline for one URL
@@ -84,11 +53,12 @@
    POST /explore           Recursive site explorer
    POST /math/humanize     LaTeX → human-readable Unicode
    POST /contacts/decode   Cloudflare email/phone protection decoder
-   POST /debug/pdf         ★ NEW: CDN response diagnostics
+   POST /debug/pdf         CDN response diagnostics
+   POST /gnews/resolve     ★ NEW: Google News URL → original publisher URL
    GET  /article/{id}      Cached article
    GET  /pdf/{id}          Cached PDF download
    GET  /health            Health check
-   GET  /                   Service info
+   GET  /                  Service info
 """
 import asyncio
 import base64
@@ -111,13 +81,14 @@ from scraper.bypass import (
 )
 from scraper.browser import StealthBrowser
 from scraper.extractors import extract_article, extract_links, extract_pdf_links, extract_image
+from scraper.gnews_resolver import is_google_news_url, resolve_google_news
 from scraper.math_pretty import humanize_formulas_in_text
 from scraper.pdf_extract import extract_pdf
 
 logger = logging.getLogger("auth-bypass-scraper")
 logging.basicConfig(level=settings.log_level.upper())
 
-app = FastAPI(title="AuthBypass Scraper", version="3.4.0")
+app = FastAPI(title="AuthBypass Scraper", version="3.5.0")
 
 _start_time = time.time()
 
@@ -225,6 +196,31 @@ def _cffi_proxies() -> dict | None:
     return None
 
 
+async def _resolve_gnews_url(url: str, chain: list[str]) -> str:
+    """
+    Layer 0: if url is a Google News redirect, resolve it to the real
+    publisher URL before running any bypass layers. Appends a chain entry
+    describing what happened. Raises 502 (fails fast — Google's redirect
+    page is a JS shell with no article, so running the full pipeline on
+    it can only ever produce EMPTY 14-word results) when resolution
+    fails and the URL is a Google News redirect.
+    """
+    if not is_google_news_url(url):
+        return url
+    resolved, how = await resolve_google_news(url)
+    if resolved:
+        chain.append(f"gnews-resolve✓({how})")
+        return resolved
+    chain.append(f"gnews-resolve✗({how})")
+    raise HTTPException(502, detail={
+        "success": False, "url": url, "bypass_chain": chain,
+        "last_error": f"google-news resolve failed: {how}",
+        "hint": "news.google.com/rss/articles/... URLs are protobuf "
+                "redirects. Resolution needs batchexecute access; if this "
+                "recurs, set PROXY_URL (residential) — Google 429s "
+                "datacenter IPs on the batchexecute endpoint."})
+
+
 def _normalize_direct_pdf_url(raw: str) -> str | None:
     """
     Normalize a decoded u= param into a fetchable URL.
@@ -306,7 +302,7 @@ def _pdf_success(url: str, cdn_url: str, pdf_bytes: bytes,
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# ANTI-BLOCK FALLBACK LAYERS (NEW in v3.2)
+# ANTI-BLOCK FALLBACK LAYERS
 # ═══════════════════════════════════════════════════════════════════════
 
 async def _flaresolverr_fetch(url: str) -> tuple[str | None, list[dict]]:
@@ -412,7 +408,7 @@ class ExtractRequest(BaseModel):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# ENDPOINT: /debug/pdf  ★ NEW — run this FIRST when bypass fails
+# ENDPOINT: /debug/pdf — run this FIRST when bypass fails
 # ═══════════════════════════════════════════════════════════════════════
 
 @app.post("/debug/pdf")
@@ -450,6 +446,29 @@ async def debug_pdf(req: PdfDirectRequest):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# ENDPOINT: /gnews/resolve ★ NEW — standalone Google News URL resolver
+# ═══════════════════════════════════════════════════════════════════════
+
+@app.post("/gnews/resolve")
+async def gnews_resolve_endpoint(req: PdfDirectRequest):
+    """
+    Resolve a news.google.com/rss/articles/... redirect to the original
+    publisher URL. Use this instead of the extension's own (dead,
+    offline-decode) Google resolver.
+    """
+    resolved, how = await resolve_google_news(req.url)
+    if not resolved:
+        raise HTTPException(502, detail={
+            "success": False, "url": req.url,
+            "error": how,
+            "hint": "If this fails repeatedly, set PROXY_URL "
+                    "(residential) — Google 429s batchexecute from "
+                    "datacenter IPs."})
+    return {"success": True, "original_url": req.url,
+            "resolved_url": resolved, "method": how}
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # ENDPOINT: /pdf/direct — gated PDF-viewer bypass
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -459,6 +478,7 @@ async def pdf_direct(req: PdfDirectRequest):
     Bypass gated PDF viewers (testbook-style ?u= param).
 
     Strategy chain (each falls through to next on failure):
+      0. Google News redirect resolution (if the URL is one) ★ NEW
       1. Decode u= param → direct CDN URLs (variants with/without scheme)
       2. Direct CDN fetch with viewer Referer (proxy-routed curl_cffi)
       2.5 FlareSolverr: solve CF challenge, replay cf_clearance cookies
@@ -470,6 +490,9 @@ async def pdf_direct(req: PdfDirectRequest):
     url = req.url.strip()
     chain: list[str] = []
 
+    # ── Step 0: Google News redirect resolution ────────────────────────
+    url = await _resolve_gnews(url_=url, chain=chain)
+
     # ── Step 1: decode viewer u= param into direct CDN candidates ──────
     u_param = _viewer_u_param(url)
     direct_urls: list[str] = []
@@ -477,7 +500,6 @@ async def pdf_direct(req: PdfDirectRequest):
         normalized = _normalize_direct_pdf_url(u_param)
         if normalized:
             direct_urls.append(normalized)
-            # variant without extension confusion: also try raw filename
         chain.append(f"u-decode({normalized or 'failed'})")
     else:
         direct_urls.append(_normalize_direct_pdf_url(url) or url)
@@ -525,7 +547,6 @@ async def pdf_direct(req: PdfDirectRequest):
                 if c.get("name") and c.get("value"))
             warm_headers = {**headers, **({"Cookie": cookie_header}
                                           if cookie_header else {})}
-            # try embedded PDF URL from solved page
             m = re.search(
                 r'https?://[^\s"\'<>\\]+?\.pdf[^\s"\'<>\\]*', html)
             candidates = ([m.group(0).replace("\\u002F", "/").replace("\\/", "/")]
@@ -643,9 +664,19 @@ async def pdf_direct(req: PdfDirectRequest):
 @app.post("/scrape")
 async def scrape(req: ScrapeRequest):
     """Full bypass pipeline: article text + PDFs + contacts + math."""
-    url = req.url.strip()
+    original_url = req.url.strip()
+    url = original_url
     chain: list[str] = []
     contact_meta: dict = {"emails": [], "phones": []}
+
+    # ── Layer 0: Google News redirect resolution ★ NEW ─────────────────
+    # news.google.com/rss/articles/CBMi...?oc=5 URLs are protobuf-encoded
+    # click-tracking redirects. Fetching them directly "succeeds" (HTTP
+    # 200 from news.google.com) but yields only Google's JS shell — the
+    # source of EMPTY 14-word 'successes'. Resolve to the real publisher
+    # URL first; fail fast if resolution fails, since no bypass layer can
+    # extract an article from Google's shell page.
+    url = await _resolve_gnews(url_=url, chain=chain)
 
     # ── Layer 1+2: fast HTTP path (curl_cffi, proxy-routed) ────────────
     html = None
@@ -654,14 +685,8 @@ async def scrape(req: ScrapeRequest):
         html = await _fetcher.fetch_html(url)
         chain.append("curl_cffi✓")
     except Exception as e:
-        # str(e) for a curl_cffi failure is bypass.py's own
-        # "All stealth HTTP attempts failed: {last_err}" message — it
-        # already contains the real per-fingerprint reason (HTTP status,
-        # connection error, etc.), but was previously dropped here in
-        # favor of just the wrapper exception's class name (always
-        # "RuntimeError"), which told you THAT every fingerprint failed
-        # but never WHY. Truncated so one runaway message can't blow up
-        # the chain array.
+        # str(e) is bypass.py's "All stealth HTTP attempts failed:
+        # {last_err}" message — contains the real per-fingerprint reason.
         detail = str(e).strip().replace("\n", " ")[:200]
         chain.append(f"curl_cffi✗({type(e).__name__}: {detail})" if detail
                      else f"curl_cffi✗({type(e).__name__})")
@@ -671,11 +696,6 @@ async def scrape(req: ScrapeRequest):
         html = None
 
     # ── Layer 2.5: FlareSolverr (solves Cloudflare JS challenges) ──────
-    # Already built and wired into /pdf/direct, but never reused here —
-    # /scrape fell straight from a failed/challenged curl_cffi attempt to
-    # the full stealth browser, skipping this cheaper, purpose-built
-    # layer entirely. Only runs if FLARESOLVERR_URL is configured and
-    # curl_cffi didn't already succeed.
     if not html and settings.flaresolverr_url:
         fs_html, _fs_cookies = await _flaresolverr_fetch(url)
         if fs_html and not _looks_like_challenge(fs_html.encode()):
@@ -718,16 +738,9 @@ async def scrape(req: ScrapeRequest):
                 if article and article.get("text"):
                     chain.append("stealth-browser✓")
                 else:
-                    # The browser DID load a page and returned HTML — no
-                    # exception, so this is not a browser✗ — but none of
-                    # extract_article's strategies (JSON-LD/__NEXT_DATA__/
-                    # readability, each requiring ~200-300+ chars of real
-                    # body text) found actual article content in it. That's
-                    # what a bot-check, consent wall, or paywall page looks
-                    # like: valid HTML, no article. Previously this still
-                    # logged as a plain "stealth-browser✓", which reads as
-                    # full success and hides that the page the browser
-                    # landed on had no usable content.
+                    # Browser loaded a page (valid HTML) but none of
+                    # extract_article's strategies found real content —
+                    # what a bot-check/consent/paywall page looks like.
                     err = result.get("last_error")
                     chain.append(
                         f"stealth-browser⚠(loaded, no article extracted"
@@ -743,16 +756,9 @@ async def scrape(req: ScrapeRequest):
 
     if article is None or not article.get("text"):
         # ── Layer 4: ScraperAPI residential pool (last resort before
-        # archive) ───────────────────────────────────────────────────
-        # Already built and wired into /pdf/direct's last-resort step,
-        # but never reused here. This is the layer most likely to
-        # actually turn a hard 403 into a 200: curl_cffi failing on
-        # EVERY TLS fingerprint AND both bot UAs (as with Reuters) is a
-        # strong signal of IP/ASN-reputation blocking at the CDN/WAF
-        # level (Akamai/PerimeterX-class), which no amount of header or
-        # fingerprint spoofing from this instance's own datacenter IP can
-        # get around — only a different, residential-pool IP can. Only
-        # runs if SCRAPERAPI_KEY is configured.
+        # archive). The layer most likely to turn a hard IP-reputation
+        # 403 (Reuters-style) into a 200 — only a different IP can do
+        # that. Only runs if SCRAPERAPI_KEY is configured.
         if settings.scraperapi_key:
             sa_bytes = await _scraperapi_fetch(url)
             if sa_bytes and not _is_pdf_bytes(sa_bytes):
@@ -773,7 +779,7 @@ async def scrape(req: ScrapeRequest):
                 chain.append("scraperapi✗(no usable html)")
 
     if article is None or not article.get("text"):
-        # Layer 5: archive fallback
+        # ── Layer 5: archive fallback ──────────────────────────────────
         try:
             archive_html = await _fetcher.fetch_archive(url)
             if archive_html:
@@ -789,7 +795,8 @@ async def scrape(req: ScrapeRequest):
 
     if article is None:
         raise HTTPException(502, detail={
-            "success": False, "url": url, "bypass_chain": chain,
+            "success": False, "url": url, "original_url": original_url,
+            "bypass_chain": chain,
             "last_error": "all layers failed — see bypass_chain"})
 
     cid = _content_id(url)
@@ -809,7 +816,9 @@ async def scrape(req: ScrapeRequest):
 
     return {
         "success": True,
-        "url": url,
+        "url": url,                    # final (resolved) URL
+        "original_url": original_url,  # what the caller sent
+        "resolved_url": url,           # explicit alias for /extract shim
         "article_url": f"/article/{cid}",
         "pdf_url": None,
         "pdf_data": None,
@@ -833,10 +842,9 @@ async def scrape(req: ScrapeRequest):
 # The extension's extractWithRenderServer() always POSTs to "{server}/extract"
 # with {url, render, max_chars} and reads back {paragraphs, text, image,
 # word_count, method, resolved_url, extraction_score, errors, diagnostics}.
-# It uses this same call for BOTH Render deployments (the light extractor
-# and this bypass server) so it can fail over between them transparently.
-# This server's real pipeline lives at /scrape, so this just re-shapes that
-# response instead of duplicating the pipeline.
+# v3.5: resolved_url now carries the REAL publisher URL (post-Google-News
+# resolution) instead of the news.google.com redirect, so the extension's
+# logs stop showing the CBMi... redirect as "resolved".
 @app.post("/extract")
 async def extract_compat(req: ExtractRequest):
     try:
@@ -858,7 +866,7 @@ async def extract_compat(req: ExtractRequest):
         "image": result.get("image") or "",
         "word_count": len(text.split()),
         "method": "bypass-browser" if result.get("used_browser") else "bypass-http",
-        "resolved_url": result.get("url", req.url),
+        "resolved_url": result.get("resolved_url") or result.get("url", req.url),
         "extraction_score": 100 if len(text) >= 250 else 0,
         "errors": [],
         "diagnostics": {"bypass_chain": result.get("bypass_chain", [])},
@@ -1019,7 +1027,7 @@ async def get_pdf(pdf_id: str):
 async def health():
     return {
         "status": "healthy",
-        "version": "3.2",
+        "version": "3.5",
         "uptime_seconds": round(time.time() - _start_time, 1),
         "browsers_active": _browser_in_use,
         "proxy_configured": bool(settings.proxy_url),
@@ -1027,33 +1035,4 @@ async def health():
         "scraperapi_configured": bool(settings.scraperapi_key),
         "cached_articles": len(_article_cache),
         "cached_pdfs": len(_pdf_cache),
-    }
-
-
-@app.get("/")
-async def root():
-    return {
-        "service": "AuthBypass Scraper",
-        "version": "3.2",
-        "endpoints": {
-            "POST /scrape": "Full bypass pipeline for one URL",
-            "POST /extract": "NEWS BYTE extension compatibility shim (→ /scrape)",
-            "POST /batch": "Batch scrape (max 25)",
-            "POST /pdf/direct": "Gated PDF-viewer bypass (?u= decode)",
-            "POST /pdf/extract": "Extract text from base64 PDF (+OCR)",
-            "POST /explore": "Recursive site explorer",
-            "POST /math/humanize": "LaTeX → human-readable Unicode",
-            "POST /contacts/decode": "Cloudflare email/phone decoder",
-            "POST /debug/pdf": "★ Diagnose CDN response from this IP",
-            "GET /article/{id}": "Cached article",
-            "GET /pdf/{id}": "Cached PDF download",
-            "GET /health": "Health check",
-        },
-        "docs": "/docs",
-    }
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=settings.port,
-                workers=1, log_level=settings.log_level.lower())
+",
