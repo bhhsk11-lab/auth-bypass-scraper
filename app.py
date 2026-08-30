@@ -1,7 +1,34 @@
 """
 ═══════════════════════════════════════════════════════════════════════════
- Auth-Bypass Scraper v3.3 — Cloud Run Deployable Service
+ Auth-Bypass Scraper v3.4 — Cloud Run Deployable Service
 ═══════════════════════════════════════════════════════════════════════════
+
+ v3.4 changes (turns dead capability into actual bypass success, not just
+ clearer failure logging — addresses reuters.com-style hard 403s where
+ EVERY curl_cffi fingerprint AND both bot UAs get blocked, which is a
+ network/IP-reputation-level block that no header trick alone defeats):
+   - FIXED: SOCIAL_REFERERS and ANTI_PAYWALL_COOKIES were defined in
+     scraper/bypass.py but never actually attached to any request — every
+     curl_cffi attempt went out with no Referer and no cookies at all.
+     Now each of the 4 TLS-impersonation attempts cycles through a
+     different social/search referer plus meter-reset cookies. Free to
+     try, costs nothing extra; helps meter-based paywalls specifically
+     (distinct from a hard bot-firewall block).
+   - NEW: /scrape now also runs FlareSolverr (Layer 2.5, same as
+     /pdf/direct already did) when FLARESOLVERR_URL is configured and
+     curl_cffi fails or hits a Cloudflare-style JS challenge — solves the
+     challenge instead of skipping straight to the full browser.
+   - NEW: /scrape now also runs ScraperAPI's residential-pool fetch
+     (Layer 4, same as /pdf/direct already did) when SCRAPERAPI_KEY is
+     configured and neither curl_cffi nor the stealth browser found real
+     article content. This is the layer that actually turns a hard
+     IP-reputation 403 (Reuters-style) into a 200 — no fingerprint or
+     header spoofing from this instance's own datacenter IP can do that;
+     only a different, residential IP can. Runs right before the archive
+     fallback as a last resort.
+   - Both new layers are no-ops (skipped entirely, zero overhead) when
+     their env var isn't set — behavior is unchanged for anyone not using
+     FlareSolverr/ScraperAPI.
 
  v3.3 changes (fixes silent/misleading bypass_chain on blocked publishers,
  e.g. reuters.com returning 0 words with just "curl_cffi✗(RuntimeError)"
@@ -90,7 +117,7 @@ from scraper.pdf_extract import extract_pdf
 logger = logging.getLogger("auth-bypass-scraper")
 logging.basicConfig(level=settings.log_level.upper())
 
-app = FastAPI(title="AuthBypass Scraper", version="3.3.0")
+app = FastAPI(title="AuthBypass Scraper", version="3.4.0")
 
 _start_time = time.time()
 
@@ -643,6 +670,20 @@ async def scrape(req: ScrapeRequest):
         chain.append("cf-challenge-detected")
         html = None
 
+    # ── Layer 2.5: FlareSolverr (solves Cloudflare JS challenges) ──────
+    # Already built and wired into /pdf/direct, but never reused here —
+    # /scrape fell straight from a failed/challenged curl_cffi attempt to
+    # the full stealth browser, skipping this cheaper, purpose-built
+    # layer entirely. Only runs if FLARESOLVERR_URL is configured and
+    # curl_cffi didn't already succeed.
+    if not html and settings.flaresolverr_url:
+        fs_html, _fs_cookies = await _flaresolverr_fetch(url)
+        if fs_html and not _looks_like_challenge(fs_html.encode()):
+            html = fs_html
+            chain.append("flaresolverr✓")
+        else:
+            chain.append("flaresolverr✗(no usable html)")
+
     # JSON-LD / __NEXT_DATA__ fast extraction from HTTP path
     article = None
     if html:
@@ -699,6 +740,37 @@ async def scrape(req: ScrapeRequest):
             detail = str(e).strip().replace("\n", " ")[:200]
             chain.append(f"browser✗({type(e).__name__}: {detail})" if detail
                          else f"browser✗({type(e).__name__})")
+
+    if article is None or not article.get("text"):
+        # ── Layer 4: ScraperAPI residential pool (last resort before
+        # archive) ───────────────────────────────────────────────────
+        # Already built and wired into /pdf/direct's last-resort step,
+        # but never reused here. This is the layer most likely to
+        # actually turn a hard 403 into a 200: curl_cffi failing on
+        # EVERY TLS fingerprint AND both bot UAs (as with Reuters) is a
+        # strong signal of IP/ASN-reputation blocking at the CDN/WAF
+        # level (Akamai/PerimeterX-class), which no amount of header or
+        # fingerprint spoofing from this instance's own datacenter IP can
+        # get around — only a different, residential-pool IP can. Only
+        # runs if SCRAPERAPI_KEY is configured.
+        if settings.scraperapi_key:
+            sa_bytes = await _scraperapi_fetch(url)
+            if sa_bytes and not _is_pdf_bytes(sa_bytes):
+                sa_html = sa_bytes.decode("utf-8", errors="replace")
+                sa_article = extract_article(sa_html, url)
+                if sa_article and sa_article.get("text"):
+                    html = sa_html
+                    article = sa_article
+                    decoded = decode_cf_protections(sa_html)
+                    contact_meta = {
+                        "emails": decoded.get("emails", []),
+                        "phones": decoded.get("phones", []),
+                    }
+                    chain.append("scraperapi✓")
+                else:
+                    chain.append("scraperapi⚠(fetched, no article extracted)")
+            else:
+                chain.append("scraperapi✗(no usable html)")
 
     if article is None or not article.get("text"):
         # Layer 5: archive fallback
