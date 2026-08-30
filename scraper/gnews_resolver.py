@@ -1,288 +1,506 @@
+"""Robust Google News URL resolver.
+
+Resolves Google News article redirects to the publisher URL without ever
+accepting arbitrary URLs (for example googleusercontent image URLs) found in
+Google's HTML.
+
+Resolution order:
+  1. Direct URL query parameter, when present and valid.
+  2. Embedded/legacy URL decoding from the article token.
+  3. Google's current batchexecute/garturlreq flow using data-n-a-sg and
+     data-n-a-ts from the article page.
+  4. googlenewsdecoder package fallback, when installed.
+
+Returns: (resolved_url | None, method_or_error)
 """
-Google News redirect-URL resolver.
 
-news.google.com/rss/articles/CBMi...?oc=5 URLs are protobuf-encoded
-click-tracking redirects, NOT real article URLs. Resolution strategy:
+from __future__ import annotations
 
-  1. Direct 'url=' query parameter (some redirects include it).
-  2. Offline base64/protobuf decode (old‑style IDs embed the URL).
-  3. batchexecute RPC (Fbv4je / garturlreq) with signature+timestamp
-     scraped from the redirect page — required for new‑style AU_yqL
-     IDs (July 2024+).
-  4. batchexecute without sig/ts (legacy fallback).
-
-Google rate‑limits batchexecute hard from datacenter IPs (429s), so all
-calls route through PROXY_URL when configured, results are LRU‑cached,
-and calls are serialized with a minimum interval. Retries are implemented
-for transient errors.
-"""
 import asyncio
 import base64
+import binascii
 import json
 import logging
 import re
 import time
 from collections import OrderedDict
-from urllib.parse import parse_qs, urlparse
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
+from typing import Any
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
+from bs4 import BeautifulSoup
 from curl_cffi import requests as cffi_requests
 
 from config import settings
 
 logger = logging.getLogger("gnews-resolver")
 
-_BATCHEXECUTE_URL = "https://news.google.com/_/DotsSplashUi/data/batchexecute?rpcids=Fbv4je"
+BATCHEXECUTE_URL = (
+    "https://news.google.com/_/DotsSplashUi/data/batchexecute?rpcids=Fbv4je"
+)
 
-# ── LRU cache for resolved URLs ──────────────────────────────────────
-_RESOLVE_CACHE_MAX = 2000
-_resolve_cache: OrderedDict = OrderedDict()
+CACHE_MAX = 2000
+_CACHE: OrderedDict[str, str] = OrderedDict()
+_LOCK = asyncio.Lock()
+_LAST_CALL = 0.0
+_MIN_INTERVAL = 0.80
 
-# Serialize batchexecute calls + politeness delay (429 hotspot)
-_resolve_lock = asyncio.Lock()
-_last_call_ts = 0.0
-_MIN_INTERVAL_S = 0.75
+GOOGLE_HOSTS = {
+    "google.com",
+    "www.google.com",
+    "news.google.com",
+    "googleusercontent.com",
+    "www.googleusercontent.com",
+    "gstatic.com",
+    "www.gstatic.com",
+}
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/149.0.0.0 Safari/537.36"
+)
+
+
+def _proxy() -> str | None:
+    return getattr(settings, "proxy_url", None) or None
+
+
+def _proxies() -> dict[str, str] | None:
+    p = _proxy()
+    return {"http": p, "https": p} if p else None
 
 
 def is_google_news_url(url: str) -> bool:
-    """Check if the URL is a Google News redirect (rss/articles/...)."""
     try:
-        parsed = urlparse(url)
-        host = parsed.hostname or ""
+        p = urlparse(str(url).strip())
+        host = (p.hostname or "").lower().rstrip(".")
+        return host == "news.google.com" and any(
+            p.path.rstrip("/").startswith(prefix)
+            for prefix in ("/rss/articles/", "/articles/", "/read/")
+        )
     except Exception:
         return False
-    # Some URLs may have host as news.google.com or subdomains
-    return host == "news.google.com" or host.endswith(".news.google.com")
 
 
 def _cache_get(url: str) -> str | None:
-    if url in _resolve_cache:
-        _resolve_cache.move_to_end(url)
-        return _resolve_cache[url]
-    return None
+    value = _CACHE.get(url)
+    if value:
+        _CACHE.move_to_end(url)
+    return value
 
 
-def _cache_put(url: str, resolved: str):
-    _resolve_cache[url] = resolved
-    _resolve_cache.move_to_end(url)
-    while len(_resolve_cache) > _RESOLVE_CACHE_MAX:
-        _resolve_cache.popitem(last=False)
+def _cache_put(url: str, resolved: str) -> None:
+    _CACHE[url] = resolved
+    _CACHE.move_to_end(url)
+    while len(_CACHE) > CACHE_MAX:
+        _CACHE.popitem(last=False)
 
 
-def _proxies() -> dict | None:
-    if settings.proxy_url:
-        return {"http": settings.proxy_url, "https": settings.proxy_url}
-    return None
-
-
-# ── Strategy 1: offline protobuf base64 decode (old‑style IDs) ──────
-def _decode_offline(b64: str) -> str | None:
+def _article_id(url: str) -> str | None:
     try:
-        s = base64.urlsafe_b64decode(b64 + "=" * (-len(b64) % 4))
+        p = urlparse(url)
+        parts = [unquote(x) for x in p.path.split("/") if x]
+        for marker in ("rss", "articles", "read"):
+            if marker in parts:
+                i = parts.index(marker)
+                if i + 1 < len(parts):
+                    token = parts[i + 1].strip()
+                    if token:
+                        return token
+        return None
     except Exception:
         return None
-    if s.startswith(b"\x08\x13\x22"):
-        s = s[3:]
-    if s.endswith(b"\xd2\x01\x00"):
-        s = s[:-3]
-    if not s:
-        return None
-    first = s[0]
-    if first >= 0x80:
-        s = s[2:first + 2] if len(s) >= first + 2 else s[2:]
-    else:
-        s = s[1:first + 1] if len(s) >= first + 1 else s[1:]
+
+
+def _looks_like_http_url(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    value = value.strip().strip("\"'")
     try:
-        out = s.decode("utf-8")
-    except UnicodeDecodeError:
+        p = urlparse(value)
+        return p.scheme in {"http", "https"} and bool(p.hostname)
+    except Exception:
+        return False
+
+
+def _is_google_internal_url(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").lower().rstrip(".")
+    except Exception:
+        return True
+    return (
+        host == "news.google.com"
+        or host.endswith(".google.com")
+        or host == "google.com"
+        or host.endswith(".googleusercontent.com")
+        or host.endswith(".gstatic.com")
+    )
+
+
+def _valid_publisher_url(value: Any, original: str) -> str | None:
+    """Accept only a real HTTP(S) publisher URL; reject Google internals."""
+    if not _looks_like_http_url(value):
         return None
-    return out if out.startswith("http") else None
+
+    candidate = str(value).strip()
+    if candidate == original:
+        return None
+    if _is_google_internal_url(candidate):
+        return None
+
+    try:
+        p = urlparse(candidate)
+        if not p.hostname:
+            return None
+        # Never accept a URL that is just a Google redirect host.
+        return candidate
+    except Exception:
+        return None
 
 
-# ── batchexecute plumbing ────────────────────────────────────────────
-def _build_freq(gn_art_id: str, sig: str = "", ts: str = "") -> str:
+def _decode_offline(token: str) -> str | None:
+    """Best-effort decoding for older Google News tokens.
+
+    This is intentionally conservative: decoded text is returned only when it
+    is an actual HTTP(S) URL. It is never used as a generic HTML URL scraper.
     """
-    Build the URL‑encoded f.req body for the Fbv4je 'garturlreq' RPC.
+    raw_token = token.split("?", 1)[0]
+    try:
+        raw = base64.urlsafe_b64decode(raw_token + "=" * (-len(raw_token) % 4))
+    except (ValueError, binascii.Error):
+        return None
 
-    Structure is based on traffic captured from news.google.com in Chrome.
-    The nested list layout is critical for the server to accept the request.
-    """
-    # The base request structure
-    inner_req = [
-        "garturlreq",
-        [
-            [
-                ["en-US", "US", ["FINANCE_TOP_INDICES", "WEB_TEST_1_0_0"], None,
-                 None, 1, 1, "US:en", None, 180, None, None, None, None, 0,
-                 None, None, [1608992183, 723341000]],
-                "en-US", "US", 1, [2, 3, 4, 8], 1, 0, "655000234", 0, 0,
-                None, 0
-            ]
-        ],
-        gn_art_id,
-    ]
-    if sig and ts:
-        inner_req += [ts, sig, False]
-    # The outer wrapper: [ [ [ RPC_ID, JSON_string, None, "generic" ] ] ]
-    freq = json.dumps([[["Fbv4je", json.dumps(inner_req), None, "generic"]]])
-    # URL‑encode the whole thing as 'f.req=...'
-    return "f.req=" + quote(freq)
+    # Search decoded bytes for a complete URL. Older tokens often contain the
+    # source URL as a length-delimited protobuf field. Search is limited to
+    # ASCII URL bytes and then validated strictly.
+    for match in re.finditer(rb"https?://[^\x00\"'<>\s]+", raw):
+        try:
+            candidate = match.group(0).decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            continue
+        candidate = candidate.rstrip(".,);]")
+        if _looks_like_http_url(candidate) and not _is_google_internal_url(candidate):
+            return candidate
+
+    return None
 
 
-# We need urllib.parse.quote for the encoding
-from urllib.parse import quote
-
-
-def _get_redirect_page(url: str):
-    """Fetch the redirect page and return (html, cookies)."""
-    r = cffi_requests.get(
+def _get_page(url: str) -> tuple[str, dict[str, str], int]:
+    response = cffi_requests.get(
         url,
         impersonate="chrome124",
         timeout=20,
         allow_redirects=True,
         proxies=_proxies(),
         headers={
-            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "User-Agent": UA,
+            "Cache-Control": "no-cache",
         },
     )
-    return r.text, r.cookies
+    cookies = {str(k): str(v) for k, v in response.cookies.items()}
+    return response.text, cookies, response.status_code
 
 
-def _parse_garturlres(text: str) -> str | None:
-    """Extract the resolved URL from a batchexecute response."""
-    try:
-        # The response is a JSON with a leading `)]}'` sometimes
-        payload = text[text.index("["):]
-        data = json.loads(payload)
-        # data is typically a list of lists
-        for row in data:
-            try:
-                # The third element is a JSON string containing the actual result
-                inner = json.loads(row[2])  # row[2] is the string
-                if (isinstance(inner, list) and len(inner) > 1
-                        and inner[0] == "garturlres"
-                        and isinstance(inner[1], str)
-                        and inner[1].startswith("http")):
-                    return inner[1]
-            except (json.JSONDecodeError, TypeError, IndexError, ValueError):
-                continue
-    except (ValueError, json.JSONDecodeError):
-        pass
-    # Fallback regex in case parsing fails
-    m = re.search(r'garturlres\\",\\"(https?://[^\\",]+)', text)
-    return m.group(1) if m else None
+def _extract_decoding_params(html: str, article_id: str) -> tuple[str | None, str | None]:
+    """Extract sig/timestamp only from Google's article metadata."""
+    soup = BeautifulSoup(html, "lxml")
+
+    candidates = []
+    for node in soup.find_all(attrs={"data-n-a-sg": True}):
+        candidates.append(node)
+    for node in soup.find_all(attrs={"data-n-a-ts": True}):
+        if node not in candidates:
+            candidates.append(node)
+
+    # Prefer the node whose data-n-a-id equals our exact article token.
+    exact = [n for n in candidates if n.get("data-n-a-id") == article_id]
+    ordered = exact + [n for n in candidates if n not in exact]
+
+    for node in ordered:
+        sig = node.get("data-n-a-sg")
+        ts = node.get("data-n-a-ts")
+        if sig and ts and str(ts).isdigit():
+            return str(sig), str(ts)
+
+    # Fallback to the common c-wiz > div structure used by Google's page.
+    node = soup.select_one("c-wiz > div[data-n-a-sg][data-n-a-ts]")
+    if node is not None:
+        sig = node.get("data-n-a-sg")
+        ts = node.get("data-n-a-ts")
+        if sig and ts and str(ts).isdigit():
+            return str(sig), str(ts)
+
+    # Last resort: attribute regex, still requiring both attributes in the
+    # same HTML neighborhood rather than extracting arbitrary href/src URLs.
+    m = re.search(
+        r'data-n-a-sg=["\']([^"\']+)["\'][^>]{0,1200}?'
+        r'data-n-a-ts=["\'](\d+)["\']',
+        html,
+        re.I | re.S,
+    )
+    if m:
+        return m.group(1), m.group(2)
+
+    m = re.search(
+        r'data-n-a-ts=["\'](\d+)["\'][^>]{0,1200}?'
+        r'data-n-a-sg=["\']([^"\']+)["\']',
+        html,
+        re.I | re.S,
+    )
+    if m:
+        return m.group(2), m.group(1)
+
+    return None, None
 
 
-# Retry decorator for batchexecute (transient errors)
-def _is_retryable(exception):
-    """Return True if we should retry the batchexecute call."""
-    if isinstance(exception, Exception):
-        msg = str(exception).lower()
-        return any(x in msg for x in ("timeout", "429", "rate", "too many", "500", "502", "503"))
-    return False
+def _build_freq(article_id: str, timestamp: str, signature: str) -> str:
+    """Build Google's Fbv4je/garturlreq request."""
+    garturlreq = [
+        "garturlreq",
+        [
+            [
+                "X",
+                "X",
+                ["X", "X"],
+                None,
+                None,
+                1,
+                1,
+                "US:en",
+                None,
+                1,
+                None,
+                None,
+                None,
+                None,
+                0,
+                1,
+            ],
+            "X",
+            "X",
+            1,
+            [1, 1, 1],
+            1,
+            1,
+            None,
+            0,
+            0,
+            None,
+            0,
+        ],
+        article_id,
+        int(timestamp),
+        signature,
+    ]
+
+    rpc = ["Fbv4je", json.dumps(garturlreq, separators=(",", ":"))]
+    outer = json.dumps([[rpc]], separators=(",", ":"))
+    return "f.req=" + quote(outer, safe="")
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=5),
-    retry=retry_if_exception(_is_retryable),
-    reraise=True,
-)
-def _post_batchexecute(freq_body: str, cookies: dict) -> str:
-    """Make the batchexecute POST request with retries."""
-    r = cffi_requests.post(
-        _BATCHEXECUTE_URL,
-        data=freq_body,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
-            "Referer": "https://news.google.com/",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        },
-        cookies=cookies,
+def _post_batchexecute(body: str, cookies: dict[str, str]) -> str:
+    response = cffi_requests.post(
+        BATCHEXECUTE_URL,
+        data=body,
         impersonate="chrome124",
         timeout=25,
         allow_redirects=True,
         proxies=_proxies(),
+        cookies=cookies,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "Accept": "*/*",
+            "Origin": "https://news.google.com",
+            "Referer": "https://news.google.com/",
+            "User-Agent": UA,
+        },
     )
-    if r.status_code != 200:
-        raise RuntimeError(f"batchexecute HTTP {r.status_code}")
-    return r.text
+    if response.status_code != 200:
+        raise RuntimeError(f"batchexecute-http-{response.status_code}")
+    return response.text
+
+
+def _walk_garturlres(value: Any) -> str | None:
+    """Find only values belonging to a garturlres response record."""
+    if isinstance(value, list):
+        if value and value[0] == "garturlres":
+            if len(value) > 1 and _looks_like_http_url(value[1]):
+                return value[1]
+        for item in value:
+            found = _walk_garturlres(item)
+            if found:
+                return found
+    elif isinstance(value, dict):
+        for item in value.values():
+            found = _walk_garturlres(item)
+            if found:
+                return found
+    return None
+
+
+def _parse_batchexecute(text: str, original_url: str) -> str | None:
+    """Parse Google's XSSI/JSON-ish batchexecute response robustly."""
+    # First parse every plausible JSON fragment after Google's XSSI prefix.
+    fragments = []
+    stripped = text.lstrip()
+    if stripped.startswith(")]}'"):
+        stripped = stripped[4:].lstrip("\r\n")
+    fragments.append(stripped)
+
+    # Google commonly separates the JSON payload from a prefix with blank
+    # lines. Trying each non-empty line also handles variant responses.
+    fragments.extend(x.strip() for x in text.split("\n") if x.strip())
+
+    seen = set()
+    for fragment in fragments:
+        if fragment in seen:
+            continue
+        seen.add(fragment)
+        try:
+            data = json.loads(fragment)
+        except Exception:
+            continue
+        candidate = _walk_garturlres(data)
+        valid = _valid_publisher_url(candidate, original_url)
+        if valid:
+            return valid
+
+    # Fallback: locate an encoded garturlres JSON string, but still validate
+    # only the URL immediately associated with that marker.
+    patterns = [
+        r'garturlres\\?"\s*,\s*\\?"(https?://[^"\\]+)',
+        r'garturlres["\']\s*,\s*["\'](https?://[^"\']+)',
+    ]
+    for pattern in patterns:
+        for m in re.finditer(pattern, text):
+            candidate = m.group(1).replace(r"\/", "/")
+            valid = _valid_publisher_url(candidate, original_url)
+            if valid:
+                return valid
+
+    return None
+
+
+def _decode_with_batchexecute(url: str, article_id: str) -> tuple[str | None, str]:
+    """Resolve one URL using Google's official-in-practice internal RPC flow."""
+    errors = []
+
+    # Current decoder implementations fetch /articles first, then fall back
+    # to /rss/articles when extracting data-n-a-sg/data-n-a-ts.
+    page_urls = [
+        f"https://news.google.com/articles/{quote(article_id, safe='')}",
+        f"https://news.google.com/rss/articles/{quote(article_id, safe='')}",
+    ]
+
+    for page_url in page_urls:
+        try:
+            html, cookies, status = _get_page(page_url)
+            if status != 200 or not html:
+                errors.append(f"params-http-{status}")
+                continue
+
+            sig, ts = _extract_decoding_params(html, article_id)
+            if not sig or not ts:
+                errors.append("decoding-params-not-found")
+                continue
+
+            body = _build_freq(article_id, ts, sig)
+            response_text = _post_batchexecute(body, cookies)
+            resolved = _parse_batchexecute(response_text, url)
+            if resolved:
+                return resolved, "batchexecute"
+
+            errors.append("garturlres-not-found")
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}:{str(exc)[:100]}")
+
+    return None, "batchexecute-failed:" + ";".join(errors[-4:])
+
+
+def _decode_with_package(url: str) -> tuple[str | None, str]:
+    """Fallback to googlenewsdecoder 0.1.7 if installed."""
+    try:
+        from googlenewsdecoder import gnewsdecoder
+    except Exception:
+        return None, "googlenewsdecoder-not-installed"
+
+    try:
+        kwargs = {"interval": 1}
+        proxy = _proxy()
+        if proxy:
+            kwargs["proxy"] = proxy
+
+        result = gnewsdecoder(url, **kwargs)
+        if isinstance(result, dict) and result.get("status"):
+            candidate = _valid_publisher_url(result.get("decoded_url"), url)
+            if candidate:
+                return candidate, "googlenewsdecoder"
+            return None, "googlenewsdecoder-invalid-result"
+
+        message = result.get("message") if isinstance(result, dict) else "decode-failed"
+        return None, f"googlenewsdecoder-failed:{str(message)[:120]}"
+    except Exception as exc:
+        return None, f"googlenewsdecoder-error:{type(exc).__name__}:{str(exc)[:100]}"
 
 
 async def resolve_google_news(url: str) -> tuple[str | None, str]:
-    """
-    Resolve a Google News redirect URL to the original publisher URL.
-    Returns (resolved_url, method_or_error). resolved_url is None on failure.
-    Non‑Google‑News URLs pass through unchanged.
-    """
-    if not is_google_news_url(url):
-        return url, "not-a-gnews-url"
+    """Resolve a Google News URL.
 
-    cached = _cache_get(url)
+    Non-Google-News URLs pass through unchanged.
+    A failed Google News resolution returns (None, reason), never a random
+    Google image/internal URL.
+    """
+    original = str(url).strip()
+
+    if not is_google_news_url(original):
+        return original, "not-a-gnews-url"
+
+    cached = _cache_get(original)
     if cached:
         return cached, "cache"
 
-    # ── Fast path: extract direct 'url=' parameter ──────────────────
-    parsed = urlparse(url)
+    parsed = urlparse(original)
     qs = parse_qs(parsed.query)
-    if "url" in qs and qs["url"][0].startswith("http"):
-        direct = qs["url"][0]
-        _cache_put(url, direct)
-        return direct, "url-param"
+    direct = qs.get("url", [None])[0]
+    valid_direct = _valid_publisher_url(direct, original)
+    if valid_direct:
+        _cache_put(original, valid_direct)
+        return valid_direct, "url-param"
 
-    global _last_call_ts
-
-    # ── Extract article ID from path ────────────────────────────────
-    path = parsed.path.rstrip("/")
-    b64 = path.rsplit("/", 1)[-1]
-    if not b64:
+    article_id = _article_id(original)
+    if not article_id:
         return None, "no-article-id"
 
-    # ── Offline decode (works for older IDs) ────────────────────────
-    offline = _decode_offline(b64)
-    if offline:
-        _cache_put(url, offline)
-        return offline, "b64-decode"
+    # Old Google News tokens can contain the original URL directly.
+    offline = _decode_offline(article_id)
+    valid_offline = _valid_publisher_url(offline, original)
+    if valid_offline:
+        _cache_put(original, valid_offline)
+        return valid_offline, "b64-decode"
 
-    # ── Fetch redirect page to get sig/ts and cookies ──────────────
-    sig = ts = ""
-    cookies = {}
-    try:
-        html, cookies = await asyncio.to_thread(_get_redirect_page, url)
-        # Extract data-n-a-sg and data-n-a-ts
-        m_sig = re.search(r'data-n-a-sg="([^"]*)"', html)
-        m_ts = re.search(r'data-n-a-ts="([^"]*)"', html)
-        sig = m_sig.group(1) if m_sig else ""
-        ts = m_ts.group(1) if m_ts else ""
-        logger.debug(f"Extracted sig={sig[:10]}..., ts={ts}")
-    except Exception as e:
-        logger.warning(f"Failed to fetch redirect page: {e}")
+    global _LAST_CALL
 
-    # ── Serialize calls to avoid hitting rate limits ────────────────
-    async with _resolve_lock:
-        wait = _last_call_ts + _MIN_INTERVAL_S - time.monotonic()
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _last_call_ts = time.monotonic()
+    async with _LOCK:
+        delay = _LAST_CALL + _MIN_INTERVAL - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        _LAST_CALL = time.monotonic()
 
-        # Build two attempts: with sig/ts, then without
-        attempts = []
-        if sig and ts:
-            attempts.append(("batchexecute+sig", _build_freq(b64, sig, ts)))
-        attempts.append(("batchexecute-legacy", _build_freq(b64)))
+        resolved, method = await asyncio.to_thread(
+            _decode_with_batchexecute, original, article_id
+        )
+        if resolved:
+            _cache_put(original, resolved)
+            return resolved, method
 
-        last_err = "unknown"
-        for method, body in attempts:
-            try:
-                resp = await asyncio.to_thread(_post_batchexecute, body, cookies)
-                resolved = _parse_garturlres(resp)
-                if resolved:
-                    _cache_put(url, resolved)
-                    return resolved, method
-                last_err = f"no garturlres (resp len={len(resp)})"
-            except Exception as e:
-                last_err = f"{type(e).__name__}: {str(e)[:120]}"
-                logger.warning(f"batchexecute {method} failed: {last_err}")
-        return None, last_err
+        # Package fallback is deliberately after the direct implementation.
+        resolved, package_method = await asyncio.to_thread(
+            _decode_with_package, original
+        )
+        if resolved:
+            _cache_put(original, resolved)
+            return resolved, package_method
+
+        return None, f"{method};{package_method}"
