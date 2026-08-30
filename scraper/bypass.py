@@ -48,7 +48,19 @@ class StealthFetcher:
 
     async def fetch_html(self, url: str) -> str:
         last_err = None
-        for imposter in self.IMPERSONATE_CHAIN:
+        # SOCIAL_REFERERS/ANTI_PAYWALL_COOKIES were defined but never
+        # actually attached to a request — every attempt below went out
+        # with no Referer and no cookies at all. A Referer claiming the
+        # visit came from Google News/social is a legitimate, common
+        # signal that softens meter-based paywalls specifically (distinct
+        # from a hard bot-firewall block); the ANTI_PAYWALL_COOKIES are a
+        # best-effort meter-reset attempt for Piano/TinyPass-style CMSes.
+        # Neither helps against a network/IP-reputation-level block (see
+        # PROXY_URL/FLARESOLVERR_URL/SCRAPERAPI_KEY for that), but they're
+        # free to try and cost nothing extra per attempt.
+        cookies = {c["name"]: c["value"] for c in ANTI_PAYWALL_COOKIES}
+        for i, imposter in enumerate(self.IMPERSONATE_CHAIN):
+            referer = SOCIAL_REFERERS[i % len(SOCIAL_REFERERS)]
             try:
                 r = cffi_requests.get(
                     url,
@@ -56,19 +68,21 @@ class StealthFetcher:
                     timeout=settings.request_timeout,
                     allow_redirects=True,
                     proxies=_proxies(),
+                    cookies=cookies,
                     headers={
                         "Accept": ("text/html,application/xhtml+xml,"
                                    "application/xml;q=0.9,*/*;q=0.8"),
                         "Accept-Language": "en-US,en;q=0.9",
+                        "Referer": referer,
                         "Sec-Fetch-Dest": "document",
                         "Sec-Fetch-Mode": "navigate",
-                        "Sec-Fetch-Site": "none",
+                        "Sec-Fetch-Site": "cross-site",
                         "Upgrade-Insecure-Requests": "1",
                     },
                 )
                 if r.status_code == 200:
                     return r.text
-                last_err = f"HTTP {r.status_code} ({imposter})"
+                last_err = f"HTTP {r.status_code} ({imposter}, referer={referer})"
             except Exception as e:
                 last_err = str(e)
         # bot-UA fallback
@@ -82,6 +96,7 @@ class StealthFetcher:
                     allow_redirects=True, proxies=_proxies())
                 if r.status_code == 200:
                     return r.text
+                last_err = f"HTTP {r.status_code} ({name})"
             except Exception as e:
                 last_err = str(e)
         raise RuntimeError(f"All stealth HTTP attempts failed: {last_err}")
