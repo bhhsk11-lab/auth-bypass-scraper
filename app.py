@@ -56,7 +56,7 @@ from scraper.bypass import (
     StealthFetcher, cf_decode_email, cf_decode_phones, decode_cf_protections,
 )
 from scraper.browser import StealthBrowser
-from scraper.extractors import extract_article, extract_links, extract_pdf_links
+from scraper.extractors import extract_article, extract_links, extract_pdf_links, extract_image
 from scraper.math_pretty import humanize_formulas_in_text
 from scraper.pdf_extract import extract_pdf
 
@@ -669,6 +669,7 @@ async def scrape(req: ScrapeRequest):
     # PDF links from final HTML
     final_html = article.get("html", html or "")
     pdf_links = extract_pdf_links(final_html, base_url=url)
+    image = extract_image(final_html, url)
 
     return {
         "success": True,
@@ -680,6 +681,7 @@ async def scrape(req: ScrapeRequest):
         "links": extract_links(final_html, base_url=url)[:100],
         "title": article.get("title"),
         "text": text if req.want_text else None,
+        "image": image,
         "emails": contact_meta.get("emails", []),
         "phones": contact_meta.get("phones", []),
         "math": {"formulas_converted": formulas, "count": len(formulas)},
@@ -717,7 +719,7 @@ async def extract_compat(req: ExtractRequest):
     return {
         "paragraphs": paragraphs,
         "text": text,
-        "image": "",
+        "image": result.get("image") or "",
         "word_count": len(text.split()),
         "method": "bypass-browser" if result.get("used_browser") else "bypass-http",
         "resolved_url": result.get("url", req.url),
