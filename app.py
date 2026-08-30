@@ -1,7 +1,34 @@
 """
 ═══════════════════════════════════════════════════════════════════════════
- Auth-Bypass Scraper v3.2 — Cloud Run Deployable Service
+ Auth-Bypass Scraper v3.3 — Cloud Run Deployable Service
 ═══════════════════════════════════════════════════════════════════════════
+
+ v3.3 changes (fixes silent/misleading bypass_chain on blocked publishers,
+ e.g. reuters.com returning 0 words with just "curl_cffi✗(RuntimeError)"
+ and "stealth-browser✓" and no way to tell why):
+   - FIXED: StealthBrowser never routed through PROXY_URL — only curl_cffi
+     did (scraper/bypass.py's _proxies()). A publisher that blocks/
+     challenges datacenter IPs at the network level (Reuters and similar)
+     would see one from the browser layer too, even with a residential
+     proxy configured, since the browser simply never used it.
+     launch_persistent_context() now takes a proxy= built from PROXY_URL
+     (scraper/browser.py: StealthBrowser._playwright_proxy()).
+   - FIXED: "stealth-browser✓" was logged whenever Playwright returned ANY
+     html, whether or not extract_article() found real content in it — so
+     a bot-check/consent/paywall page (valid HTML, no article) looked
+     identical to a genuine success in bypass_chain. Now logs
+     "stealth-browser⚠(loaded, no article extracted)" in that case, and
+     "stealth-browser✗(...)" if the browser returned no html at all.
+   - FIXED: curl_cffi✗ and browser✗ chain entries logged only the
+     exception's class name (always "RuntimeError" for the curl_cffi
+     layer, since bypass.py wraps every per-fingerprint failure into one
+     generic RuntimeError) and dropped the actual reason. Both now include
+     the exception's message (e.g. "HTTP 403 (chrome124)"), truncated to
+     200 chars.
+   - FIXED: the archive.ph/web.archive.org fallback failed completely
+     silently (bare `except: pass`) — no chain entry at all if it found
+     nothing or errored. Now logs archive✓ / archive⚠(fetched, no article
+     extracted) / archive✗(reason), same pattern as the other layers.
 
  v3.2 changes (fixes "still not bypassed" from Cloud Run):
    - NEW: /debug/pdf  — diagnose exactly what a CDN returns from this
@@ -63,7 +90,7 @@ from scraper.pdf_extract import extract_pdf
 logger = logging.getLogger("auth-bypass-scraper")
 logging.basicConfig(level=settings.log_level.upper())
 
-app = FastAPI(title="AuthBypass Scraper", version="3.2.0")
+app = FastAPI(title="AuthBypass Scraper", version="3.3.0")
 
 _start_time = time.time()
 
@@ -600,7 +627,17 @@ async def scrape(req: ScrapeRequest):
         html = await _fetcher.fetch_html(url)
         chain.append("curl_cffi✓")
     except Exception as e:
-        chain.append(f"curl_cffi✗({type(e).__name__})")
+        # str(e) for a curl_cffi failure is bypass.py's own
+        # "All stealth HTTP attempts failed: {last_err}" message — it
+        # already contains the real per-fingerprint reason (HTTP status,
+        # connection error, etc.), but was previously dropped here in
+        # favor of just the wrapper exception's class name (always
+        # "RuntimeError"), which told you THAT every fingerprint failed
+        # but never WHY. Truncated so one runaway message can't blow up
+        # the chain array.
+        detail = str(e).strip().replace("\n", " ")[:200]
+        chain.append(f"curl_cffi✗({type(e).__name__}: {detail})" if detail
+                     else f"curl_cffi✗({type(e).__name__})")
 
     if html and _looks_like_challenge(html.encode()):
         chain.append("cf-challenge-detected")
@@ -636,10 +673,32 @@ async def scrape(req: ScrapeRequest):
                     "emails": decoded.get("emails", []),
                     "phones": decoded.get("phones", []),
                 }
-                chain.append("stealth-browser✓")
                 used_browser = True
+                if article and article.get("text"):
+                    chain.append("stealth-browser✓")
+                else:
+                    # The browser DID load a page and returned HTML — no
+                    # exception, so this is not a browser✗ — but none of
+                    # extract_article's strategies (JSON-LD/__NEXT_DATA__/
+                    # readability, each requiring ~200-300+ chars of real
+                    # body text) found actual article content in it. That's
+                    # what a bot-check, consent wall, or paywall page looks
+                    # like: valid HTML, no article. Previously this still
+                    # logged as a plain "stealth-browser✓", which reads as
+                    # full success and hides that the page the browser
+                    # landed on had no usable content.
+                    err = result.get("last_error")
+                    chain.append(
+                        f"stealth-browser⚠(loaded, no article extracted"
+                        f"{': ' + err if err else ''})"
+                    )
+            else:
+                err = (result.get("last_error") or "no html returned").strip()[:200]
+                chain.append(f"stealth-browser✗({err})")
         except Exception as e:
-            chain.append(f"browser✗({type(e).__name__})")
+            detail = str(e).strip().replace("\n", " ")[:200]
+            chain.append(f"browser✗({type(e).__name__}: {detail})" if detail
+                         else f"browser✗({type(e).__name__})")
 
     if article is None or not article.get("text"):
         # Layer 5: archive fallback
@@ -647,9 +706,14 @@ async def scrape(req: ScrapeRequest):
             archive_html = await _fetcher.fetch_archive(url)
             if archive_html:
                 article = extract_article(archive_html, url)
-                chain.append("archive✓")
-        except Exception:
-            pass
+                chain.append("archive✓" if article and article.get("text")
+                             else "archive⚠(fetched, no article extracted)")
+            else:
+                chain.append("archive✗(no archived copy found)")
+        except Exception as e:
+            detail = str(e).strip().replace("\n", " ")[:200]
+            chain.append(f"archive✗({type(e).__name__}: {detail})" if detail
+                         else f"archive✗({type(e).__name__})")
 
     if article is None:
         raise HTTPException(502, detail={
