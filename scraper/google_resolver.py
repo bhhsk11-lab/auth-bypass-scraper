@@ -254,7 +254,7 @@ class GoogleNewsResolver:
             if cls._host_is_google(host):
                 return False
             # Ignore obvious telemetry/asset destinations if found in DOM.
-            if any(x in host for x in ("doubleclick.net", "googlesyndication.com", "google-analytics.com")):
+            if any(x in host for x in ("doubleclick.net", "googlesyndication.com", "google-analytics.com", "googleapis.com")):
                 return False
             return True
         except Exception:
