@@ -10,12 +10,7 @@ from config import settings
 
 logger = logging.getLogger("bypass")
 
-BOT_UAS = {
-    "googlebot": ("Mozilla/5.0 (compatible; Googlebot/2.1; "
-                  "+http://www.google.com/bot.html)"),
-    "bingbot": ("Mozilla/5.0 (compatible; bingbot/2.0; "
-                "+http://www.bing.com/bingbot.htm)"),
-}
+BOT_UAS = {}
 
 SOCIAL_REFERERS = [
     "https://t.co/",
@@ -24,15 +19,7 @@ SOCIAL_REFERERS = [
     "https://www.linkedin.com/",
 ]
 
-ANTI_PAYWALL_COOKIES = [
-    # meter-reset / fake-subscriber cookies (Piano/TinyPass-style + common CX)
-    {"name": "piano_meter", "value": "0"},
-    {"name": "nxti", "value": "0"},
-    {"name": "ni_ispaid", "value": "1"},
-    {"name": "grv_wl", "value": "1"},
-    {"name": "sub", "value": "1"},
-    {"name": "edition-paid", "value": "1"},
-]
+ANTI_PAYWALL_COOKIES = []
 
 
 def _proxies() -> dict | None:
@@ -69,19 +56,6 @@ class StealthFetcher:
                 if r.status_code == 200:
                     return r.text
                 last_err = f"HTTP {r.status_code} ({imposter})"
-            except Exception as e:
-                last_err = str(e)
-        # bot-UA fallback
-        for name, ua in BOT_UAS.items():
-            try:
-                r = cffi_requests.get(
-                    url, headers={"User-Agent": ua,
-                                  "From": f"googlebot(at)googlebot.com"},
-                    impersonate="chrome124",
-                    timeout=settings.request_timeout,
-                    allow_redirects=True, proxies=_proxies())
-                if r.status_code == 200:
-                    return r.text
             except Exception as e:
                 last_err = str(e)
         raise RuntimeError(f"All stealth HTTP attempts failed: {last_err}")
