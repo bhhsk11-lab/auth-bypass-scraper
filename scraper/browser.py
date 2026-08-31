@@ -171,7 +171,7 @@ class StealthBrowser:
         """Fetch page in stealth context. Returns html, text, cookies,
         pdf_base64, last_error."""
         out = {"html": None, "text": None, "cookies": [],
-               "pdf_base64": None, "last_error": None}
+               "pdf_base64": None, "last_error": None, "final_url": None}
         page = None
         try:
             page = await self._context.new_page()
@@ -180,6 +180,7 @@ class StealthBrowser:
                 wait_until="domcontentloaded")
             # let late JS (paywalls, lazy content, challenges) settle
             await page.wait_for_timeout(2500)
+            out["final_url"] = page.url
             out["html"] = await page.content()
             out["text"] = await page.inner_text("body")
             out["cookies"] = await self._context.cookies(url)
