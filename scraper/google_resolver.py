@@ -38,15 +38,14 @@ BATCH_ENDPOINT = "https://news.google.com/_/DotsSplashUi/data/batchexecute"
 # unless the RPC path really fails.
 PAGE_CONCURRENCY = 3
 BATCH_CONCURRENCY = 1
-REQUEST_TIMEOUT = httpx.Timeout(7.0, connect=4.0, read=6.0, write=6.0, pool=4.0)
+REQUEST_TIMEOUT = None  # Google News resolver: no client-side timeout
 MAX_RETRIES = 2
 CACHE_TTL = 6 * 60 * 60
 NEGATIVE_TTL = 12
 CACHE_MAX = 2000
 RPC_MIN_INTERVAL = 0.75
-BROWSER_NAV_TIMEOUT_MS = 7000
-BROWSER_POLL_MS = 250
-BROWSER_POLLS = 12
+BROWSER_NAV_TIMEOUT_MS = 0  # 0 = unlimited in Playwright
+BROWSER_POLL_MS = 500
 
 _BROWSER_HEADERS = {
     "User-Agent": (
@@ -368,38 +367,64 @@ class GoogleNewsResolver:
 
     @staticmethod
     def _extract_params(html: str, article_id: str) -> dict[str, str] | None:
+        """Extract Google's *actual* garturl request data.
+
+        Google currently exposes the decoder request in a ``c-wiz``
+        ``data-p`` attribute.  This is preferable to manufacturing a
+        garturl request with guessed/placeholder values.  We retain the
+        data-n-a-* attributes as a compatibility fallback.
+        """
         soup = BeautifulSoup(html or "", "lxml")
-        # Prefer the node whose data-n-a-id matches the actual article token.
+
+        # Current page format: c-wiz[data-p] contains a serialized garturl
+        # request beginning with %.@.  Keep the complete object because the
+        # trailing fields are part of Google's request contract.
+        for node in soup.select("c-wiz[data-p]"):
+            raw = node.get("data-p")
+            if not raw:
+                continue
+            try:
+                candidate = raw.replace("%.@.", '["garturlreq",', 1)
+                obj = json.loads(candidate)
+                if isinstance(obj, list) and obj:
+                    return {"mode": "data-p", "obj": obj, "id": article_id}
+            except Exception:
+                continue
+
+        # Some Google variants put data-p on a nested element.
+        for node in soup.find_all(attrs={"data-p": True}):
+            raw = node.get("data-p")
+            if not raw:
+                continue
+            try:
+                candidate = raw.replace("%.@.", '["garturlreq",', 1)
+                obj = json.loads(candidate)
+                if isinstance(obj, list) and obj:
+                    return {"mode": "data-p", "obj": obj, "id": article_id}
+            except Exception:
+                continue
+
+        # Compatibility fallback for page variants exposing the three
+        # attributes directly.
         nodes = soup.select("c-wiz > div[data-n-a-sg][data-n-a-ts]")
         nodes += soup.select("div[data-n-a-sg][data-n-a-ts]")
-        best = None
         for node in nodes:
             sig = node.get("data-n-a-sg")
             ts = node.get("data-n-a-ts")
             data_id = node.get("data-n-a-id") or article_id
-            if not sig or not ts or not data_id:
-                continue
-            candidate = {"id": data_id, "sig": sig, "ts": ts}
-            if data_id == article_id:
-                return candidate
-            if best is None:
-                best = candidate
-        if best:
-            return best
+            if sig and ts and data_id:
+                return {"mode": "attrs", "id": data_id, "sig": sig, "ts": ts}
 
         patterns = [
-            r'data-n-a-id=["\']([^"\']+)["\'][^>]*'
-            r'data-n-a-sg=["\']([^"\']+)["\'][^>]*'
-            r'data-n-a-ts=["\']([^"\']+)',
-            r'data-n-a-sg=["\']([^"\']+)["\'][^>]*'
-            r'data-n-a-ts=["\']([^"\']+)',
+            r'data-n-a-id=["\']([^"\']+)["\'][^>]*data-n-a-sg=["\']([^"\']+)["\'][^>]*data-n-a-ts=["\']([^"\']+)',
+            r'data-n-a-sg=["\']([^"\']+)["\'][^>]*data-n-a-ts=["\']([^"\']+)',
         ]
         for i, pat in enumerate(patterns):
             m = re.search(pat, html or "", re.I | re.S)
             if m:
                 if i == 0:
-                    return {"id": m.group(1), "sig": m.group(2), "ts": m.group(3)}
-                return {"id": article_id, "sig": m.group(1), "ts": m.group(2)}
+                    return {"mode": "attrs", "id": m.group(1), "sig": m.group(2), "ts": m.group(3)}
+                return {"mode": "attrs", "id": article_id, "sig": m.group(1), "ts": m.group(2)}
         return None
 
     @classmethod
@@ -437,15 +462,27 @@ class GoogleNewsResolver:
         return None
 
     @staticmethod
-    def _rpc_payload(params: list[dict[str, str]]) -> str:
-        """Build the current Fbv4je/garturlreq payload.
+    def _rpc_payload(params: dict[str, str]) -> str:
+        """Build the Fbv4je request using Google's page-provided data.
 
-        The X placeholders are intentional; this is the request shape used by
-        current community implementations. The old resolver used a different
-        first nested array, which is more brittle against Google's changes.
+        Primary path uses the serialized ``data-p`` object and removes only
+        the page-local tail fields exactly as current decoders do.  Attribute
+        mode uses the established Fbv4je/garturlreq compatibility shape.
         """
-        requests = []
-        for p in params:
+        mode = params.get("mode")
+        if mode == "data-p":
+            obj = params.get("obj")
+            if not isinstance(obj, list):
+                raise RuntimeError("google-data-p-invalid")
+            # The current Google page embeds extra client-only tail values.
+            # Community decoders currently construct the RPC from obj[:-6]
+            # plus obj[-2:].  Do not replace its locale/signature/id values.
+            if len(obj) >= 8:
+                art_obj = obj[:-6] + obj[-2:]
+            else:
+                art_obj = obj
+            art = json.dumps(art_obj, separators=(",", ":"), ensure_ascii=False)
+        else:
             art = json.dumps(
                 [
                     "garturlreq",
@@ -457,12 +494,14 @@ class GoogleNewsResolver:
                         ],
                         "X", "X", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0,
                     ],
-                    p["id"], int(float(p["ts"])), p["sig"],
+                    params["id"], int(float(params["ts"])), params["sig"],
                 ],
                 separators=(",", ":"),
+                ensure_ascii=False,
             )
-            requests.append(["Fbv4je", art, None, "generic"])
-        return urlencode({"f.req": json.dumps([requests], separators=(",", ":"))})
+
+        rpc = [["Fbv4je", art, None, "generic"]]
+        return urlencode({"f.req": json.dumps([rpc], separators=(",", ":"))})
 
     @classmethod
     def _urls_from_rpc(cls, text: str) -> list[str]:
@@ -540,6 +579,7 @@ class GoogleNewsResolver:
                         elif response.status_code == 200:
                             params = self._extract_params(response.text, article_id)
                             if params:
+                                logger.info("Google News params extracted mode=%s id=%s", params.get("mode"), article_id[:24])
                                 return params
                             legacy = self._legacy_extract(response.text)
                             if legacy:
@@ -566,7 +606,7 @@ class GoogleNewsResolver:
                     self._last_rpc_at = time.monotonic()
                     response = await client.post(
                         BATCH_ENDPOINT,
-                        content=self._rpc_payload([params]),
+                        content=self._rpc_payload(params),
                         headers=_RPC_HEADERS,
                     )
 
@@ -617,15 +657,17 @@ class GoogleNewsResolver:
         async with self._browser_page_sem:
             page = await context.new_page()
             try:
-                page.set_default_navigation_timeout(BROWSER_NAV_TIMEOUT_MS)
-                page.set_default_timeout(2500)
+                page.set_default_navigation_timeout(0)
+                page.set_default_timeout(0)
                 await page.goto(
                     url,
                     wait_until="domcontentloaded",
-                    timeout=BROWSER_NAV_TIMEOUT_MS,
+                    timeout=0,
                 )
 
-                for _ in range(BROWSER_POLLS):
+                # No artificial abort deadline. Keep observing until Google
+                # actually exposes/navigates to a publisher URL.
+                while True:
                     current = page.url
                     if current != url and self._valid_destination(current):
                         return ResolveResult(current, "browser")
@@ -640,8 +682,6 @@ class GoogleNewsResolver:
                             return ResolveResult(best, "browser")
 
                     await asyncio.sleep(BROWSER_POLL_MS / 1000.0)
-
-                return ResolveResult(url, "browser-failed", "publisher-url-not-observed")
             except Exception as exc:
                 return ResolveResult(url, "browser-failed", f"{type(exc).__name__}: {exc}"[:240])
             finally:
