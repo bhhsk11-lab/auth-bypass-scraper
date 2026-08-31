@@ -1,6 +1,6 @@
 """
 ═══════════════════════════════════════════════════════════════════════════
- Auth-Bypass Scraper v3.3 — Cloud Run Deployable Service
+ Auth-Bypass Scraper v3.4 — Cloud Run Deployable Service
 ═══════════════════════════════════════════════════════════════════════════
 
  v3.3 changes (fixes silent/misleading bypass_chain on blocked publishers,
@@ -91,7 +91,7 @@ from scraper.pdf_extract import extract_pdf
 logger = logging.getLogger("auth-bypass-scraper")
 logging.basicConfig(level=settings.log_level.upper())
 
-app = FastAPI(title="AuthBypass Scraper", version="3.3.0")
+app = FastAPI(title="AuthBypass Scraper", version="3.4.0")
 
 _start_time = time.time()
 
@@ -151,7 +151,8 @@ async def startup():
     global _browser
     _browser = StealthBrowser(headless=settings.browser_headless)
     await _browser.start()
-    logger.info("Stealth browser ready")
+    await google_resolver.start()
+    logger.info("Publisher stealth browser and independent Google resolver browser ready")
 
 
 @app.on_event("shutdown")
@@ -392,6 +393,23 @@ class ExtractRequest(BaseModel):
 # ═══════════════════════════════════════════════════════════════════════
 # ENDPOINT: /debug/pdf  ★ NEW — run this FIRST when bypass fails
 # ═══════════════════════════════════════════════════════════════════════
+
+@app.post("/debug/google-resolve")
+async def debug_google_resolve(req: ExtractRequest):
+    """Resolve one Google News URL and expose the exact resolver path used."""
+    url = req.url.strip()
+    if not google_resolver.is_google_url(url):
+        return {"success": True, "requested_url": url, "resolved_url": url, "method": "passthrough"}
+    result = await google_resolver.resolve(url)
+    return {
+        "success": not google_resolver.is_google_url(result.url),
+        "requested_url": url,
+        "resolved_url": result.url,
+        "method": result.method,
+        "error": result.error,
+        "browser_fallback": result.method == "browser",
+    }
+
 
 @app.post("/debug/pdf")
 async def debug_pdf(req: PdfDirectRequest):
@@ -634,30 +652,17 @@ async def scrape(req: ScrapeRequest):
         gresult = await google_resolver.resolve(url)
         if gresult.method != "passthrough":
             chain.append(f"google-resolve:{gresult.method}" + (f"({gresult.error})" if gresult.error else ""))
-        if gresult.method != "failed" and gresult.url != url:
+        if gresult.method != "failed" and not google_resolver.is_google_url(gresult.url):
             url = gresult.url
         elif google_resolver.is_google_url(url):
-            # Last-resort Google redirect resolution using the same browser a
-            # real user uses. This is only for the Google redirect itself; it
-            # is not a publisher/paywall bypass. If Google changes its internal
-            # RPC again, the browser path remains independent of that RPC.
-            try:
-                browser = await get_browser()
-                gres = await browser.fetch(url)
-                browser_url = (gres.get("final_url") or "").strip()
-                if browser_url and not google_resolver.is_google_url(browser_url):
-                    url = browser_url
-                    chain.append("google-browser-resolve✓")
-                else:
-                    chain.append("google-browser-resolve✗")
-                    raise HTTPException(502, detail={"success": False, "url": requested_url,
-                        "bypass_chain": chain, "last_error": gresult.error or gres.get("last_error") or "Google News URL could not be resolved"})
-            except HTTPException:
-                raise
-            except Exception as be:
-                chain.append(f"google-browser-resolve✗({type(be).__name__})")
-                raise HTTPException(502, detail={"success": False, "url": requested_url,
-                    "bypass_chain": chain, "last_error": gresult.error or str(be)[:200]})
+            # The resolver has already tried its independent Chromium browser.
+            # Never send the unresolved Google URL to the publisher fetcher.
+            raise HTTPException(502, detail={
+                "success": False,
+                "url": requested_url,
+                "bypass_chain": chain,
+                "last_error": gresult.error or "Google News URL could not be resolved to a publisher URL",
+            })
     except HTTPException:
         raise
     except Exception as e:
@@ -994,7 +999,7 @@ async def get_pdf(pdf_id: str):
 async def health():
     return {
         "status": "healthy",
-        "version": "3.2",
+        "version": "3.4.0",
         "uptime_seconds": round(time.time() - _start_time, 1),
         "browsers_active": _browser_in_use,
         "proxy_configured": bool(settings.proxy_url),
@@ -1009,7 +1014,7 @@ async def health():
 async def root():
     return {
         "service": "AuthBypass Scraper",
-        "version": "3.2",
+        "version": "3.4.0",
         "endpoints": {
             "POST /scrape": "Full bypass pipeline for one URL",
             "POST /extract": "NEWS BYTE extension compatibility shim (→ /scrape)",
@@ -1019,6 +1024,7 @@ async def root():
             "POST /explore": "Recursive site explorer",
             "POST /math/humanize": "LaTeX → human-readable Unicode",
             "POST /contacts/decode": "Cloudflare email/phone decoder",
+            "POST /debug/google-resolve": "★ Resolve a Google News URL using RPC + independent Chromium fallback",
             "POST /debug/pdf": "★ Diagnose CDN response from this IP",
             "GET /article/{id}": "Cached article",
             "GET /pdf/{id}": "Cached PDF download",
