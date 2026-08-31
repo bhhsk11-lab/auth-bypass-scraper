@@ -97,6 +97,19 @@ class GoogleNewsResolver:
         self._browser_page_sem = asyncio.Semaphore(2)
         self._inflight: dict[str, asyncio.Future] = {}
 
+    async def start(self) -> None:
+        """Initialize the resolver lifecycle.
+
+        The Google resolver keeps its HTTP client and Chromium instance lazy so
+        application startup does not fail merely because Playwright/Chromium
+        is temporarily unavailable.  app.py calls this hook during FastAPI
+        startup, so it must exist even though there is no mandatory warm-up.
+        """
+        # Keep startup lightweight. The HTTP client is created on first use
+        # and the resolver Chromium is created only if the RPC path needs the
+        # browser fallback.
+        return None
+
     async def client(self) -> httpx.AsyncClient:
         if self._client and not self._client.is_closed:
             return self._client
