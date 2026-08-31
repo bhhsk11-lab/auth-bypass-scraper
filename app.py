@@ -84,6 +84,7 @@ from scraper.bypass import (
 )
 from scraper.browser import StealthBrowser
 from scraper.extractors import extract_article, extract_links, extract_pdf_links, extract_image
+from scraper.google_resolver import resolver as google_resolver
 from scraper.math_pretty import humanize_formulas_in_text
 from scraper.pdf_extract import extract_pdf
 
@@ -162,7 +163,11 @@ async def shutdown():
         except Exception:
             pass
         _browser = None
-    logger.info("Browser shut down")
+    try:
+        await google_resolver.close()
+    except Exception:
+        pass
+    logger.info("Browser and Google resolver shut down")
 
 
 async def get_browser() -> StealthBrowser:
@@ -616,9 +621,50 @@ async def pdf_direct(req: PdfDirectRequest):
 @app.post("/scrape")
 async def scrape(req: ScrapeRequest):
     """Full bypass pipeline: article text + PDFs + contacts + math."""
-    url = req.url.strip()
+    requested_url = req.url.strip()
+    url = requested_url
     chain: list[str] = []
     contact_meta: dict = {"emails": [], "phones": []}
+
+    # Resolve Google News redirects before any publisher fetch. This is a
+    # critical failover path: if the light extractor cannot resolve a Google
+    # URL, the bypass service must not waste its browser/HTTP budget trying to
+    # scrape the Google interstitial itself.
+    try:
+        gresult = await google_resolver.resolve(url)
+        if gresult.method != "passthrough":
+            chain.append(f"google-resolve:{gresult.method}" + (f"({gresult.error})" if gresult.error else ""))
+        if gresult.method != "failed" and gresult.url != url:
+            url = gresult.url
+        elif google_resolver.is_google_url(url):
+            # Last-resort Google redirect resolution using the same browser a
+            # real user uses. This is only for the Google redirect itself; it
+            # is not a publisher/paywall bypass. If Google changes its internal
+            # RPC again, the browser path remains independent of that RPC.
+            try:
+                browser = await get_browser()
+                gres = await browser.fetch(url)
+                browser_url = (gres.get("final_url") or "").strip()
+                if browser_url and not google_resolver.is_google_url(browser_url):
+                    url = browser_url
+                    chain.append("google-browser-resolve✓")
+                else:
+                    chain.append("google-browser-resolve✗")
+                    raise HTTPException(502, detail={"success": False, "url": requested_url,
+                        "bypass_chain": chain, "last_error": gresult.error or gres.get("last_error") or "Google News URL could not be resolved"})
+            except HTTPException:
+                raise
+            except Exception as be:
+                chain.append(f"google-browser-resolve✗({type(be).__name__})")
+                raise HTTPException(502, detail={"success": False, "url": requested_url,
+                    "bypass_chain": chain, "last_error": gresult.error or str(be)[:200]})
+    except HTTPException:
+        raise
+    except Exception as e:
+        chain.append(f"google-resolve✗({type(e).__name__})")
+        if google_resolver.is_google_url(url):
+            raise HTTPException(502, detail={"success": False, "url": requested_url,
+                "bypass_chain": chain, "last_error": str(e)[:200]})
 
     # ── Layer 1+2: fast HTTP path (curl_cffi, proxy-routed) ────────────
     html = None
@@ -738,6 +784,7 @@ async def scrape(req: ScrapeRequest):
     return {
         "success": True,
         "url": url,
+        "requested_url": requested_url,
         "article_url": f"/article/{cid}",
         "pdf_url": None,
         "pdf_data": None,
@@ -985,3 +1032,4 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=settings.port,
                 workers=1, log_level=settings.log_level.lower())
+
