@@ -44,7 +44,7 @@ def _proxies() -> dict | None:
 class StealthFetcher:
     """Layered HTTP fetch: TLS impersonation → bot UA → social referer."""
 
-    IMPERSONATE_CHAIN = ["chrome124", "safari17_0", "edge101", "firefox133"]
+    IMPERSONATE_CHAIN = ["chrome124", "safari17_0", "firefox133"]
 
     async def fetch_html(self, url: str) -> str:
         last_err = None
@@ -93,7 +93,7 @@ class StealthFetcher:
             try:
                 r = cffi_requests.get(
                     archive, impersonate="chrome124",
-                    timeout=45, allow_redirects=True, proxies=_proxies())
+                    timeout=8, allow_redirects=True, proxies=_proxies())
                 if r.status_code == 200 and len(r.text) > 2000:
                     return r.text
             except Exception:

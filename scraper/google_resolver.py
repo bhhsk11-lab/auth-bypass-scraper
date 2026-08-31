@@ -29,13 +29,13 @@ BATCH_ENDPOINT = "https://news.google.com/_/DotsSplashUi/data/batchexecute"
 
 # Keep the concurrency deliberately small. Google can return 429 from the RPC
 # even when every individual request works in isolation.
-PAGE_CONCURRENCY = 2
+PAGE_CONCURRENCY = 3
 BATCH_CONCURRENCY = 1
-REQUEST_TIMEOUT = httpx.Timeout(12.0, connect=6.0, read=10.0, write=10.0, pool=5.0)
-MAX_RETRIES = 2
+REQUEST_TIMEOUT = httpx.Timeout(7.5, connect=3.0, read=6.5, write=6.5, pool=3.0)
+MAX_RETRIES = 1
 CACHE_TTL = 6 * 60 * 60
 CACHE_MAX = 2000
-NEGATIVE_TTL = 45
+NEGATIVE_TTL = 5
 CIRCUIT_OPEN_SECONDS = 20
 RPC_MIN_INTERVAL = 0.65
 
@@ -354,9 +354,6 @@ class GoogleNewsResolver:
         cached = self._cache_get(url)
         if cached:
             return cached
-        if time.monotonic() < self._circuit_until:
-            return ResolveResult(url, "circuit-open", "google-circuit-open")
-
         article_id = self.article_id(url)
         if not article_id:
             return ResolveResult(url, "invalid-google-url", "missing-article-id")
@@ -377,9 +374,11 @@ class GoogleNewsResolver:
             raise RuntimeError("google-rpc-no-publisher-url")
         except Exception as exc:
             self._failure_count += 1
-            if self._failure_count >= 4:
-                self._circuit_until = time.monotonic() + CIRCUIT_OPEN_SECONDS
-                self._failure_count = 0
+            # Do not use a process-wide circuit breaker here. A failure for one
+            # Google News token is not evidence that unrelated tokens will fail.
+            # The old global breaker caused every concurrent request to become
+            # circuit-open for 20s after four transient failures.
+            self._failure_count = min(self._failure_count, 3)
             result = ResolveResult(url, "failed", str(exc)[:160])
             self._cache_put(url, result, NEGATIVE_TTL)
             return result
