@@ -1,6 +1,6 @@
 """
 ═══════════════════════════════════════════════════════════════════════════
- Public News Extractor v3.8.1 — Cloud Run Deployable Service
+ Auth-Bypass Scraper v3.6 — Cloud Run Deployable Service
 ═══════════════════════════════════════════════════════════════════════════
 
  v3.6 changes (fixes the mass "0 words / AbortError / circuit-open" pattern
