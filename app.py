@@ -1,7 +1,47 @@
 """
 ═══════════════════════════════════════════════════════════════════════════
- Auth-Bypass Scraper v3.4 — Cloud Run Deployable Service
+ Auth-Bypass Scraper v3.6 — Cloud Run Deployable Service
 ═══════════════════════════════════════════════════════════════════════════
+
+ v3.6 changes (fixes the mass "0 words / AbortError / circuit-open" pattern
+ seen after switching Google News resolution to "browser-first" — every
+ concurrent resolution across the WHOLE process was serialized through one
+ browser page, so a normal burst of requests queued up for 17-30+ seconds
+ until the extension's own 30s client timeout aborted them):
+   - FIXED: scraper/google_resolver.py's independent browser resolver used
+     asyncio.Semaphore(1) — literally one Google News URL could be resolved
+     at a time, process-wide, each taking ~2.5-10+ seconds (BROWSER_SETTLE_MS
+     + BROWSER_SECOND_SETTLE_MS + candidate-follow navigation). Under real
+     load this is a hard queue, not graceful degradation — the exact cause
+     of the long waits and 30s client AbortErrors in the logs. Now
+     BROWSER_CONCURRENCY = 4 (bounded, not unlimited): multiple browser
+     pages resolve in parallel in the same already-independent context,
+     which the browser was already built to support per-call
+     (new_page() per resolution) — only the semaphore artificially capped
+     it at 1.
+   - FIXED: NEGATIVE_TTL was 0 ("never poison a Google URL after a
+     transient failure") — meaning every duplicate request for a URL that
+     was ALREADY failing re-paid the full multi-second browser+RPC cost
+     from scratch, with no cache at all softening repeated hits on the same
+     bad URL. Now negatively caches failures for 20s (NEGATIVE_TTL = 20) —
+     long enough to absorb a burst of duplicate requests for the same
+     still-failing article, short enough that a genuinely transient failure
+     still gets a fresh retry soon. _cache_get() now also preserves
+     method="failed" on a negative-cache hit instead of relabeling it
+     "cache", so it stays distinguishable from an actual cached success.
+   - NEW: in-flight request coalescing (both this server's
+     scraper/google_resolver.py AND news-byte-extractor's
+     google_resolver.py). The production logs show the exact same Google
+     News article ID requested multiple times within the same few seconds —
+     expected between the two independent servers (primary → bypass
+     fallback), but also happening within a single server from overlapping
+     feed-poll requests. Previously every one of those concurrent callers
+     triggered its own full resolution; now the first caller's in-flight
+     resolution is shared with every other caller asking for the same URL
+     while it's still running, cutting redundant browser pages and RPC
+     calls directly at the source rather than just handling the fallout.
+
+ v3.4 / v3.3 / v3.2 — see prior changelog entries below.
 
  v3.3 changes (fixes silent/misleading bypass_chain on blocked publishers,
  e.g. reuters.com returning 0 words with just "curl_cffi✗(RuntimeError)"
@@ -91,7 +131,7 @@ from scraper.pdf_extract import extract_pdf
 logger = logging.getLogger("auth-bypass-scraper")
 logging.basicConfig(level=settings.log_level.upper())
 
-app = FastAPI(title="AuthBypass Scraper", version="3.4.0")
+app = FastAPI(title="AuthBypass Scraper", version="3.6.0")
 
 _start_time = time.time()
 
