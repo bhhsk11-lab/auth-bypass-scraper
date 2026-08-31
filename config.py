@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     port: int = int(os.getenv("PORT", 8080))
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     max_batch: int = int(os.getenv("MAX_BATCH", 25))
-    request_timeout: int = int(os.getenv("REQUEST_TIMEOUT", 120))
+    request_timeout: int = int(os.getenv("REQUEST_TIMEOUT", 6))
 
     # ── Anti-block layer (NEW in v3.2) ─────────────────────────────────
     # Residential/mobile proxy — routes ALL curl_cffi fetches through it.
@@ -30,7 +30,7 @@ class Settings(BaseSettings):
 
     # ── Stealth browser ─────────────────────────────────────────────────
     browser_headless: bool = True
-    browser_timeout_ms: int = int(os.getenv("BROWSER_TIMEOUT_MS", 45000))
+    browser_timeout_ms: int = int(os.getenv("BROWSER_TIMEOUT_MS", 12000))
 
     # ── PDF / OCR ───────────────────────────────────────────────────────
     pdf_max_bytes: int = int(os.getenv("PDF_MAX_BYTES", 25 * 1024 * 1024))
