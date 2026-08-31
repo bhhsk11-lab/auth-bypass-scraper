@@ -1,2 +1,1 @@
-3.6.1
-Reliability fix: reject googleapis.com as a publisher destination in Google resolver validation.
+3.7.0
