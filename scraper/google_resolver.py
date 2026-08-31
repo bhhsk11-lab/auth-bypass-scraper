@@ -32,7 +32,7 @@ BATCH_ENDPOINT = "https://news.google.com/_/DotsSplashUi/data/batchexecute"
 
 # HTTP/RPC is deliberately conservative. The browser fallback is the
 # independent source of truth when Google's internal RPC is unavailable.
-PAGE_CONCURRENCY = 2
+PAGE_CONCURRENCY = 1
 BATCH_CONCURRENCY = 1
 REQUEST_TIMEOUT = httpx.Timeout(8.0, connect=5.0, read=7.0, write=7.0, pool=5.0)
 MAX_RETRIES = 1
@@ -40,7 +40,8 @@ CACHE_TTL = 6 * 60 * 60
 CACHE_MAX = 3000
 NEGATIVE_TTL = 0  # never poison a Google URL after a transient failure
 RPC_MIN_INTERVAL = 1.0
-BROWSER_SETTLE_MS = 3500
+BROWSER_SETTLE_MS = 2500
+BROWSER_SECOND_SETTLE_MS = 2500
 
 _BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -119,8 +120,11 @@ class GoogleNewsResolver:
                 locale="en-US",
                 timezone_id="Asia/Kolkata",
                 viewport={"width": 1366, "height": 768},
+                java_script_enabled=True,
+                ignore_https_errors=False,
                 extra_http_headers={
                     "Accept-Language": "en-US,en;q=0.9",
+                    "Upgrade-Insecure-Requests": "1",
                 },
             )
             # No browser timeout is imposed here. The caller's HTTP request
@@ -512,39 +516,70 @@ class GoogleNewsResolver:
         return [u for u, _ in sorted(clean.items(), key=lambda kv: kv[1], reverse=True)]
 
     async def _resolve_browser(self, url: str) -> ResolveResult:
+        """Resolve a Google News URL using a completely independent browser.
+
+        The browser is deliberately independent from the publisher scraper:
+        no publisher routes, cookie jar, tracker filters, or HTTP session are
+        reused.  We open the exact Google URL, allow client-side navigation to
+        settle, then inspect navigation + structured metadata + links.  If the
+        page presents a normal public article link without navigating itself,
+        we follow the best candidate once in the same browser and use the
+        resulting URL as the publisher destination.
+        """
         await self.start()
         if not self._browser_context:
             return ResolveResult(url, "browser-failed", "google-browser-not-ready")
+
         async with self._browser_sem:
             page = await self._browser_context.new_page()
+            page.set_default_navigation_timeout(0)
+            page.set_default_timeout(0)
             try:
-                # `commit` returns as soon as the navigation has committed. We
-                # intentionally do not give Playwright a timeout or AbortSignal.
-                await page.goto(url, wait_until="commit", timeout=0)
-                # Allow Google's client-side redirect/navigation to complete.
-                # This is a settling wait, not an abort/deadline for the request.
+                # Exact original URL.  Do not add query parameters or rewrite
+                # the Google News token before browser navigation.
+                await page.goto(url, wait_until="domcontentloaded", timeout=0)
                 await page.wait_for_timeout(BROWSER_SETTLE_MS)
 
-                # If Google has already navigated, page.url is the strongest
-                # signal. Otherwise inspect canonical/meta/JSON-LD/external links.
                 candidates = await self._page_candidates(page, url)
                 for candidate in candidates:
                     if self._valid_destination(candidate):
                         logger.info("Google browser resolved %s -> %s", url, candidate)
                         return ResolveResult(candidate, "browser")
 
-                # A second inspection catches delayed JS navigation without
-                # restarting the browser or using another Google RPC.
-                await page.wait_for_timeout(1500)
+                # Some Google News pages expose the publisher only as a normal
+                # article anchor after client-side rendering. Follow the best
+                # external candidate once. This is navigation, not an RPC call.
+                if candidates:
+                    target = candidates[0]
+                    try:
+                        await page.goto(target, wait_until="domcontentloaded", timeout=0)
+                        await page.wait_for_timeout(BROWSER_SECOND_SETTLE_MS)
+                        final = page.url
+                        if self._valid_destination(final):
+                            logger.info("Google browser followed publisher %s -> %s", target, final)
+                            return ResolveResult(final, "browser-follow")
+                    except Exception as exc:
+                        logger.debug("Google browser candidate follow failed: %s", exc)
+
+                # One final DOM inspection catches delayed navigation/metadata.
                 candidates = await self._page_candidates(page, url)
                 for candidate in candidates:
                     if self._valid_destination(candidate):
-                        logger.info("Google browser resolved on second inspection %s -> %s", url, candidate)
+                        logger.info("Google browser resolved on final inspection %s -> %s", url, candidate)
                         return ResolveResult(candidate, "browser")
 
-                return ResolveResult(url, "browser-failed", "publisher-url-not-found")
+                title = ""
+                try:
+                    title = (await page.title()).strip()[:120]
+                except Exception:
+                    pass
+                return ResolveResult(
+                    url,
+                    "browser-failed",
+                    f"publisher-url-not-found{': ' + title if title else ''}",
+                )
             except Exception as exc:
-                return ResolveResult(url, "browser-failed", f"{type(exc).__name__}: {exc}"[:240])
+                return ResolveResult(url, "browser-failed", f"{type(exc).__name__}: {exc}"[:300])
             finally:
                 try:
                     await page.close()
@@ -563,21 +598,25 @@ class GoogleNewsResolver:
         if cached:
             return cached
 
-        # Fast path first. If it is rate-limited or otherwise fails, immediately
-        # switch to the independent browser. No global circuit breaker exists.
-        http_result = await self._resolve_http(url)
-        if http_result.method not in ("failed", "invalid-google-url") and self._valid_destination(http_result.url):
-            self._cache_put(url, http_result)
-            return http_result
-
+        # Browser-first is intentional. Google frequently rate-limits the
+        # internal batchexecute RPC. The independent Chromium path does not
+        # depend on that RPC and opens the exact user-supplied Google URL.
         browser_result = await self._resolve_browser(url)
         if self._valid_destination(browser_result.url):
             self._cache_put(url, browser_result)
             return browser_result
 
-        # Do not negative-cache failures. A transient Google 429 should not make
-        # the same article fail for every request for the next few seconds.
-        detail = "; ".join(x for x in [http_result.error, browser_result.error] if x)
+        # Only after the browser has failed do we spend an RPC attempt. This
+        # keeps the normal path independent of Google's internal endpoint and
+        # prevents a 429 from becoming the sole source of truth.
+        http_result = await self._resolve_http(url)
+        if http_result.method not in ("failed", "invalid-google-url") and self._valid_destination(http_result.url):
+            self._cache_put(url, http_result)
+            return http_result
+
+        # Do not negative-cache failures. A transient Google/network problem
+        # must not poison the same article for subsequent requests.
+        detail = "; ".join(x for x in [browser_result.error, http_result.error] if x)
         return ResolveResult(url, "failed", detail[:300] or "google-url-unresolved")
 
     async def resolve_many(self, urls: list[str]) -> list[ResolveResult]:
