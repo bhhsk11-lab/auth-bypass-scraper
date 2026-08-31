@@ -38,10 +38,33 @@ REQUEST_TIMEOUT = httpx.Timeout(8.0, connect=5.0, read=7.0, write=7.0, pool=5.0)
 MAX_RETRIES = 1
 CACHE_TTL = 6 * 60 * 60
 CACHE_MAX = 3000
-NEGATIVE_TTL = 0  # never poison a Google URL after a transient failure
+# A still-failing Google URL that keeps getting requested (very common: the
+# extension polls/retries the same feed repeatedly, and BOTH this server and
+# the primary extractor independently resolve the same article) used to pay
+# the full ~2.5-10s browser-resolution cost on EVERY single attempt, because
+# failures were never cached at all ("never poison a Google URL after a
+# transient failure"). Combined with BROWSER_CONCURRENCY effectively being 1,
+# that turned a burst of duplicate requests for the same handful of URLs into
+# a growing queue — which is what produced the 17-30s waits and 30s client
+# AbortErrors seen in production. A short negative cache (not the full 6h
+# positive TTL) still lets a genuinely-transient failure retry soon, without
+# every duplicate request in the same burst re-paying the full browser cost.
+NEGATIVE_TTL = 20
 RPC_MIN_INTERVAL = 1.0
 BROWSER_SETTLE_MS = 2500
 BROWSER_SECOND_SETTLE_MS = 2500
+# How many Google News URLs can be resolved via the independent browser at
+# once. This was hardcoded to a single asyncio.Semaphore(1) (see
+# _browser_sem below), meaning literally every concurrent resolution across
+# the ENTIRE process — regardless of how many /extract requests were
+# in-flight — was forced through one browser page at a time, each taking
+# 2.5-10+ seconds. Under real load (the extension fires many concurrent
+# /extract calls per feed refresh) this serialized queue is the direct cause
+# of the long waits and client-side 30s AbortErrors in the logs. Multiple
+# pages in the same browser context is safe and is what the browser was
+# already built to support (_browser_context.new_page() per resolution) —
+# only the semaphore artificially capped it at 1.
+BROWSER_CONCURRENCY = 4
 
 _BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -90,7 +113,18 @@ class GoogleNewsResolver:
         self._browser = None
         self._browser_context = None
         self._browser_lock = asyncio.Lock()
-        self._browser_sem = asyncio.Semaphore(1)
+        self._browser_sem = asyncio.Semaphore(BROWSER_CONCURRENCY)
+
+        # In-flight request coalescing: if the same Google News URL is asked
+        # for again while a resolution is already running (the log shows
+        # this happening constantly — the same article ID requested by both
+        # this server and the primary extractor, or the same feed poll
+        # firing overlapping requests), every caller after the first just
+        # awaits the ALREADY-running resolution instead of starting a
+        # redundant one. This directly cuts the number of concurrent browser
+        # pages/RPC calls for what is, in practice, the same handful of URLs
+        # repeated many times per burst.
+        self._inflight: dict[str, asyncio.Future] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -255,7 +289,12 @@ class GoogleNewsResolver:
             self._cache.pop(key, None)
             return None
         self._cache.move_to_end(key)
-        return ResolveResult(result.url, "cache", result.error)
+        # Preserve "failed" so a negatively-cached failure (see NEGATIVE_TTL)
+        # is still distinguishable from a genuine cached success — both in
+        # the bypass_chain the caller logs and in any method-based branching
+        # (app.py checks `result.method != "failed"` in a couple of places).
+        method = "cache" if result.method != "failed" else "failed"
+        return ResolveResult(result.url, method, result.error)
 
     def _cache_put(self, key: str, result: ResolveResult, ttl: float = CACHE_TTL) -> None:
         if ttl <= 0:
@@ -598,6 +637,27 @@ class GoogleNewsResolver:
         if cached:
             return cached
 
+        # Coalesce concurrent requests for the same URL onto one resolution.
+        existing = self._inflight.get(url)
+        if existing is not None:
+            return await existing
+
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future = loop.create_future()
+        self._inflight[url] = future
+        try:
+            result = await self._resolve_uncached(url)
+            if not future.done():
+                future.set_result(result)
+            return result
+        except Exception as exc:
+            if not future.done():
+                future.set_exception(exc)
+            raise
+        finally:
+            self._inflight.pop(url, None)
+
+    async def _resolve_uncached(self, url: str) -> ResolveResult:
         # Browser-first is intentional. Google frequently rate-limits the
         # internal batchexecute RPC. The independent Chromium path does not
         # depend on that RPC and opens the exact user-supplied Google URL.
@@ -614,10 +674,15 @@ class GoogleNewsResolver:
             self._cache_put(url, http_result)
             return http_result
 
-        # Do not negative-cache failures. A transient Google/network problem
-        # must not poison the same article for subsequent requests.
+        # Negative-cache the failure briefly (see NEGATIVE_TTL) so a burst of
+        # duplicate requests for the same still-failing URL — which the
+        # in-flight coalescing above only catches while the FIRST attempt is
+        # still running — doesn't each re-pay the full browser+RPC cost the
+        # moment that first attempt finishes and clears from _inflight.
         detail = "; ".join(x for x in [browser_result.error, http_result.error] if x)
-        return ResolveResult(url, "failed", detail[:300] or "google-url-unresolved")
+        result = ResolveResult(url, "failed", detail[:300] or "google-url-unresolved")
+        self._cache_put(url, result, ttl=NEGATIVE_TTL)
+        return result
 
     async def resolve_many(self, urls: list[str]) -> list[ResolveResult]:
         # Keep association exact. The browser fallback itself is serialized so
