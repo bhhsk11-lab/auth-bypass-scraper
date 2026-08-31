@@ -1,88 +1,71 @@
-"""Google News URL resolver with an independent Chromium fallback.
+"""Google News publisher URL resolver.
 
-Primary path: Google News page parameters + batchexecute RPC.
-Fallback path: a dedicated Playwright Chromium context that opens the exact
-Google News URL independently and discovers the publisher URL from navigation,
-canonical/meta/JSON-LD links, or external anchors.
+Resolves post-2024 Google News RSS article URLs
+(news.google.com/rss/articles/...) to the real publisher article URL.
 
-The browser resolver is intentionally separate from the publisher browser:
-Google resolution must not inherit publisher-page routing, cookies, challenge
-state, or tracker-blocking rules.
+Design:
+1. Validate that the input is actually a Google News article URL.
+2. Fetch Google's article page and obtain data-n-a-id/data-n-a-sg/data-n-a-ts.
+3. Use the documented-by-reverse-engineering garturl Fbv4je batchexecute RPC.
+4. Parse garturlres specifically; never choose arbitrary URLs from the response.
+5. If RPC is rate-limited/unavailable, use an independent Chromium page only
+   as a fallback and extract publisher-looking canonical/OG/JSON-LD/anchor URLs.
+6. Never accept Google infrastructure, XML namespaces, schema URLs, assets,
+   tracking URLs, or arbitrary third-party links as the publisher URL.
 """
+from __future__ import annotations
+
 import asyncio
 import base64
 import json
 import logging
+import random
 import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from urllib.parse import parse_qs, unquote, urlencode, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
-
-from config import settings
 
 logger = logging.getLogger("google_resolver")
 
 GOOGLE_HOST = "news.google.com"
 BATCH_ENDPOINT = "https://news.google.com/_/DotsSplashUi/data/batchexecute"
 
-# HTTP/RPC is deliberately conservative. The browser fallback is the
-# independent source of truth when Google's internal RPC is unavailable.
-PAGE_CONCURRENCY = 1
+# Keep Google requests bounded. Do not create a browser page per feed item
+# unless the RPC path really fails.
+PAGE_CONCURRENCY = 3
 BATCH_CONCURRENCY = 1
-REQUEST_TIMEOUT = httpx.Timeout(8.0, connect=5.0, read=7.0, write=7.0, pool=5.0)
-MAX_RETRIES = 1
+REQUEST_TIMEOUT = httpx.Timeout(7.0, connect=4.0, read=6.0, write=6.0, pool=4.0)
+MAX_RETRIES = 2
 CACHE_TTL = 6 * 60 * 60
-CACHE_MAX = 3000
-# A still-failing Google URL that keeps getting requested (very common: the
-# extension polls/retries the same feed repeatedly, and BOTH this server and
-# the primary extractor independently resolve the same article) used to pay
-# the full ~2.5-10s browser-resolution cost on EVERY single attempt, because
-# failures were never cached at all ("never poison a Google URL after a
-# transient failure"). Combined with BROWSER_CONCURRENCY effectively being 1,
-# that turned a burst of duplicate requests for the same handful of URLs into
-# a growing queue — which is what produced the 17-30s waits and 30s client
-# AbortErrors seen in production. A short negative cache (not the full 6h
-# positive TTL) still lets a genuinely-transient failure retry soon, without
-# every duplicate request in the same burst re-paying the full browser cost.
-NEGATIVE_TTL = 20
-RPC_MIN_INTERVAL = 1.0
-BROWSER_SETTLE_MS = 2500
-BROWSER_SECOND_SETTLE_MS = 2500
-# How many Google News URLs can be resolved via the independent browser at
-# once. This was hardcoded to a single asyncio.Semaphore(1) (see
-# _browser_sem below), meaning literally every concurrent resolution across
-# the ENTIRE process — regardless of how many /extract requests were
-# in-flight — was forced through one browser page at a time, each taking
-# 2.5-10+ seconds. Under real load (the extension fires many concurrent
-# /extract calls per feed refresh) this serialized queue is the direct cause
-# of the long waits and client-side 30s AbortErrors in the logs. Multiple
-# pages in the same browser context is safe and is what the browser was
-# already built to support (_browser_context.new_page() per resolution) —
-# only the semaphore artificially capped it at 1.
-BROWSER_CONCURRENCY = 4
-
-_BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/149.0.0.0 Safari/537.36"
-)
+NEGATIVE_TTL = 12
+CACHE_MAX = 2000
+RPC_MIN_INTERVAL = 0.75
+BROWSER_NAV_TIMEOUT_MS = 7000
+BROWSER_POLL_MS = 250
+BROWSER_POLLS = 12
 
 _BROWSER_HEADERS = {
-    "User-Agent": _BROWSER_UA,
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/149.0.0.0 Safari/537.36"
+    ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
     "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
 }
 
 _RPC_HEADERS = {
-    "User-Agent": _BROWSER_UA,
+    "User-Agent": _BROWSER_HEADERS["User-Agent"],
     "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
     "Origin": "https://news.google.com",
@@ -107,120 +90,89 @@ class GoogleNewsResolver:
         self._client: httpx.AsyncClient | None = None
         self._client_lock = asyncio.Lock()
         self._last_rpc_at = 0.0
-
-        # Independent browser state. This is NOT the publisher StealthBrowser.
-        self._pw = None
         self._browser = None
+        self._playwright = None
         self._browser_context = None
         self._browser_lock = asyncio.Lock()
-        self._browser_sem = asyncio.Semaphore(BROWSER_CONCURRENCY)
-
-        # In-flight request coalescing: if the same Google News URL is asked
-        # for again while a resolution is already running (the log shows
-        # this happening constantly — the same article ID requested by both
-        # this server and the primary extractor, or the same feed poll
-        # firing overlapping requests), every caller after the first just
-        # awaits the ALREADY-running resolution instead of starting a
-        # redundant one. This directly cuts the number of concurrent browser
-        # pages/RPC calls for what is, in practice, the same handful of URLs
-        # repeated many times per burst.
+        self._browser_page_sem = asyncio.Semaphore(2)
         self._inflight: dict[str, asyncio.Future] = {}
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
-    async def start(self) -> None:
-        """Start the independent Google-resolution Chromium once per process."""
-        if self._browser_context:
-            return
-        async with self._browser_lock:
-            if self._browser_context:
-                return
-            self._pw = await async_playwright().start()
-            proxy = self._playwright_proxy()
-            launch_kwargs = {
-                "headless": True,
-                "args": [
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
-            }
-            if proxy:
-                launch_kwargs["proxy"] = proxy
-            self._browser = await self._pw.chromium.launch(**launch_kwargs)
-            self._browser_context = await self._browser.new_context(
-                user_agent=_BROWSER_UA,
-                locale="en-US",
-                timezone_id="Asia/Kolkata",
-                viewport={"width": 1366, "height": 768},
-                java_script_enabled=True,
-                ignore_https_errors=False,
-                extra_http_headers={
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Upgrade-Insecure-Requests": "1",
-                },
-            )
-            # No browser timeout is imposed here. The caller's HTTP request
-            # is not aborted by a resolver timer, and Playwright navigation is
-            # started at `commit` so a slow page cannot block waiting for every
-            # subresource before we inspect the destination.
-            self._browser_context.set_default_timeout(0)
-            self._browser_context.set_default_navigation_timeout(0)
-            await self._browser_context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-            )
-            logger.info("Independent Google News browser resolver ready")
+    async def client(self) -> httpx.AsyncClient:
+        if self._client and not self._client.is_closed:
+            return self._client
+        async with self._client_lock:
+            if self._client is None or self._client.is_closed:
+                self._client = httpx.AsyncClient(
+                    headers=_BROWSER_HEADERS,
+                    follow_redirects=True,
+                    max_redirects=6,
+                    timeout=REQUEST_TIMEOUT,
+                    http2=True,
+                )
+        return self._client
 
     async def close(self) -> None:
-        if self._browser_context:
+        if self._browser_context is not None:
             try:
                 await self._browser_context.close()
             except Exception:
                 pass
             self._browser_context = None
-        if self._browser:
+        if self._browser is not None:
             try:
                 await self._browser.close()
             except Exception:
                 pass
             self._browser = None
-        if self._pw:
+        if self._playwright is not None:
             try:
-                await self._pw.stop()
+                await self._playwright.stop()
             except Exception:
                 pass
-            self._pw = None
+            self._playwright = None
         if self._client and not self._client.is_closed:
             await self._client.aclose()
-            self._client = None
 
-    @staticmethod
-    def _playwright_proxy() -> dict | None:
-        if not settings.proxy_url:
-            return None
-        try:
-            p = urlparse(settings.proxy_url)
-            if not p.scheme or not p.hostname:
-                return None
-            out = {"server": f"{p.scheme}://{p.hostname}:{p.port}" if p.port else f"{p.scheme}://{p.hostname}"}
-            if p.username:
-                out["username"] = p.username
-            if p.password:
-                out["password"] = p.password
-            return out
-        except Exception:
-            logger.warning("Invalid PROXY_URL for Google browser; using direct egress")
-            return None
+    async def _get_browser(self):
+        """Independent Chromium used only for Google News resolution."""
+        if self._browser_context is not None:
+            return self._browser_context
+        async with self._browser_lock:
+            if self._browser_context is not None:
+                return self._browser_context
+            try:
+                from playwright.async_api import async_playwright
+            except ImportError as exc:
+                raise RuntimeError("playwright-not-installed") from exc
 
-    # ------------------------------------------------------------------
-    # Classification / validation
-    # ------------------------------------------------------------------
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
+            self._browser_context = await self._browser.new_context(
+                user_agent=_BROWSER_HEADERS["User-Agent"],
+                viewport={"width": 1365, "height": 900},
+                locale="en-US",
+                timezone_id="America/New_York",
+                ignore_https_errors=False,
+            )
+            await self._browser_context.set_extra_http_headers(
+                {"Accept-Language": "en-US,en;q=0.9"}
+            )
+            return self._browser_context
+
     @staticmethod
     def is_google_url(url: str) -> bool:
         try:
-            p = urlparse(str(url))
-            return (p.hostname or "").lower() == GOOGLE_HOST and (
+            p = urlparse(str(url).strip())
+            host = (p.hostname or "").lower().rstrip(".")
+            return host == GOOGLE_HOST and (
                 p.path.startswith("/rss/articles/")
                 or p.path.startswith("/articles/")
                 or p.path.startswith("/read/")
@@ -238,106 +190,199 @@ class GoogleNewsResolver:
             return None
 
     @staticmethod
-    def _host_is_google(host: str) -> bool:
+    def _host_is_google_infra(host: str) -> bool:
         h = (host or "").lower().rstrip(".")
-        return h == "google.com" or h.endswith(".google.com") or h == "googleusercontent.com" or h.endswith(".googleusercontent.com") or h == "gstatic.com" or h.endswith(".gstatic.com")
+        return (
+            h == "google.com" or h.endswith(".google.com")
+            or h == "gstatic.com" or h.endswith(".gstatic.com")
+            or h == "googleusercontent.com" or h.endswith(".googleusercontent.com")
+            or h == "googleapis.com" or h.endswith(".googleapis.com")
+            or h == "ggpht.com" or h.endswith(".ggpht.com")
+            or h == "googlevideo.com" or h.endswith(".googlevideo.com")
+        )
+
+    @staticmethod
+    def _host_is_non_article_infra(host: str) -> bool:
+        h = (host or "").lower().rstrip(".")
+        exact = {
+            "w3.org", "www.w3.org",
+            "schema.org", "www.schema.org",
+            "xml.org", "www.xml.org",
+            "example.com", "example.org", "example.net",
+            "localhost",
+        }
+        if h in exact:
+            return True
+        if h.endswith(".w3.org") or h.endswith(".schema.org"):
+            return True
+        # Common tracking/asset/CDN infrastructure. These are not accepted
+        # unless the actual publisher domain is separately identified.
+        return any(x in h for x in (
+            "doubleclick.net", "googlesyndication.com",
+            "google-analytics.com", "googletagmanager.com",
+            "googleadservices.com", "facebook.com", "facebook.net",
+            "twitter.com", "x.com", "youtube.com", "youtube-nocookie.com",
+            "instagram.com", "linkedin.com",
+        ))
 
     @classmethod
     def _valid_destination(cls, value: str | None) -> bool:
+        """Strict publisher URL gate.
+
+        A URL is NOT a publisher merely because it is external to Google.
+        This is the critical protection against values such as
+        https://www.w3.org/XML/1998/namespace appearing in XML/HTML.
+        """
         if not value:
             return False
         try:
+            value = unquote(str(value)).strip()
             p = urlparse(value)
-            host = (p.hostname or "").lower()
+            host = (p.hostname or "").lower().rstrip(".")
             if p.scheme not in ("http", "https") or not host:
                 return False
-            if cls._host_is_google(host):
+            if cls._host_is_google_infra(host) or cls._host_is_non_article_infra(host):
                 return False
-            # Ignore obvious telemetry/asset destinations if found in DOM.
-            if any(x in host for x in ("doubleclick.net", "googlesyndication.com", "google-analytics.com", "googleapis.com")):
+            if host.startswith(("cdn.", "static.", "assets.", "fonts.", "img.")):
+                # Do not blindly reject real publishers using these prefixes;
+                # require an article-like path below.
+                path = (p.path or "").lower()
+                if not any(x in path for x in (
+                    "/article", "/news/", "/story/", "/stories/",
+                    "/world/", "/business/", "/sports/", "/technology/",
+                )):
+                    return False
+
+            path = (p.path or "").lower()
+            if re.search(
+                r"\.(?:js|css|mjs|woff2?|ttf|otf|eot|png|jpe?g|gif|webp|svg|ico|"
+                r"mp4|webm|mp3|wav|json|xml)(?:$|\?)",
+                path,
+            ):
                 return False
+
+            # XML namespace / schema URLs often have these path forms.
+            if host in {"w3.org", "www.w3.org"}:
+                return False
+            if path in {"/xml/1998/namespace", "/2001/xml.xsd"}:
+                return False
+
             return True
         except Exception:
             return False
 
     @classmethod
-    def _normalize_candidate(cls, value: str, base_url: str) -> str | None:
-        try:
-            value = unquote(value).strip().replace("\\/", "/")
-            if not value or value.startswith(("javascript:", "data:", "mailto:", "tel:")):
-                return None
-            from urllib.parse import urljoin
-            absolute = urljoin(base_url, value)
-            p = urlparse(absolute)
-            if p.scheme not in ("http", "https"):
-                return None
-            # Remove fragments only; preserve query because it can be part of
-            # the publisher's canonical URL.
-            return absolute.split("#", 1)[0] if cls._valid_destination(absolute) else None
-        except Exception:
-            return None
+    def _article_like_score(cls, url: str, anchor_text: str = "") -> int:
+        p = urlparse(url)
+        path = (p.path or "").lower()
+        score = 0
+        if len(path.strip("/")) >= 20:
+            score += 8
+        if any(x in path for x in (
+            "/article", "/news/", "/story/", "/stories/", "/world/",
+            "/business/", "/sports/", "/technology/", "/politics/",
+            "/india/", "/entertainment/", "/science/", "/health/",
+        )):
+            score += 15
+        if path in ("", "/"):
+            score -= 35
+        text = (anchor_text or "").strip().lower()
+        if len(text) >= 25:
+            score += 4
+        if text and any(x in text for x in ("read", "article", "news", "story")):
+            score += 3
+        return score
 
-    # ------------------------------------------------------------------
-    # Cache
-    # ------------------------------------------------------------------
-    def _cache_get(self, key: str) -> ResolveResult | None:
-        item = self._cache.get(key)
-        if not item:
-            return None
-        expires, result = item
-        if expires <= time.monotonic():
-            self._cache.pop(key, None)
-            return None
-        self._cache.move_to_end(key)
-        # Preserve "failed" so a negatively-cached failure (see NEGATIVE_TTL)
-        # is still distinguishable from a genuine cached success — both in
-        # the bypass_chain the caller logs and in any method-based branching
-        # (app.py checks `result.method != "failed"` in a couple of places).
-        method = "cache" if result.method != "failed" else "failed"
-        return ResolveResult(result.url, method, result.error)
+    @classmethod
+    def _browser_candidates(cls, html: str, current_url: str) -> list[str]:
+        """Extract only plausible publisher URLs from Google-rendered HTML.
 
-    def _cache_put(self, key: str, result: ResolveResult, ttl: float = CACHE_TTL) -> None:
-        if ttl <= 0:
-            return
-        self._cache[key] = (time.monotonic() + ttl, result)
-        self._cache.move_to_end(key)
-        while len(self._cache) > CACHE_MAX:
-            self._cache.popitem(last=False)
+        Never regex every URL in the page and accept the first external URL.
+        That old behavior is exactly how the W3 XML namespace became a fake
+        publisher.
+        """
+        scored: dict[str, int] = {}
+        soup = BeautifulSoup(html or "", "lxml")
 
-    # ------------------------------------------------------------------
-    # HTTP/RPC resolver
-    # ------------------------------------------------------------------
-    async def client(self) -> httpx.AsyncClient:
-        if self._client and not self._client.is_closed:
-            return self._client
-        async with self._client_lock:
-            if self._client is None or self._client.is_closed:
-                self._client = httpx.AsyncClient(
-                    headers=_BROWSER_HEADERS,
-                    follow_redirects=True,
-                    max_redirects=8,
-                    timeout=REQUEST_TIMEOUT,
-                    http2=True,
-                )
-        return self._client
+        def add(value: str | None, base_score: int, text: str = "") -> None:
+            if not value:
+                return
+            value = unquote(str(value)).strip()
+            if value.startswith("//"):
+                value = "https:" + value
+            absolute = urljoin(current_url, value).split("#", 1)[0]
+            if not cls._valid_destination(absolute):
+                return
+            score = base_score + cls._article_like_score(absolute, text)
+            scored[absolute] = max(scored.get(absolute, -999), score)
+
+        # Canonical / OG are strongest. These should beat arbitrary links.
+        for tag_name, attrs, field, score in (
+            ("link", {"rel": lambda v: v and "canonical" in v}, "href", 120),
+            ("meta", {"property": "og:url"}, "content", 115),
+            ("meta", {"name": "twitter:url"}, "content", 105),
+        ):
+            for tag in soup.find_all(tag_name, attrs=attrs):
+                add(tag.get(field), score)
+
+        # JSON-LD URLs, but only after strict validation.
+        for script in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
+            try:
+                data = json.loads(script.string or script.get_text() or "")
+            except Exception:
+                continue
+
+            def walk(obj):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        if k == "url" and isinstance(v, str):
+                            add(v, 100)
+                        else:
+                            walk(v)
+                elif isinstance(obj, list):
+                    for item in obj:
+                        walk(item)
+
+            walk(data)
+
+        # Google sometimes renders the source as an ordinary external anchor.
+        # Anchor text is retained for scoring, unlike the old raw URL regex.
+        for a in soup.find_all("a", href=True):
+            text = a.get_text(" ", strip=True)
+            add(a.get("href"), 65, text)
+
+        return [u for u, _ in sorted(scored.items(), key=lambda kv: (-kv[1], kv[0]))]
 
     @staticmethod
     def _extract_params(html: str, article_id: str) -> dict[str, str] | None:
-        soup = BeautifulSoup(html, "lxml")
-        candidates = soup.select("c-wiz > div[data-n-a-sg][data-n-a-ts]")
-        candidates += soup.select("div[data-n-a-sg][data-n-a-ts]")
-        for node in candidates:
+        soup = BeautifulSoup(html or "", "lxml")
+        # Prefer the node whose data-n-a-id matches the actual article token.
+        nodes = soup.select("c-wiz > div[data-n-a-sg][data-n-a-ts]")
+        nodes += soup.select("div[data-n-a-sg][data-n-a-ts]")
+        best = None
+        for node in nodes:
             sig = node.get("data-n-a-sg")
             ts = node.get("data-n-a-ts")
             data_id = node.get("data-n-a-id") or article_id
-            if sig and ts and data_id:
-                return {"id": data_id, "sig": sig, "ts": ts}
+            if not sig or not ts or not data_id:
+                continue
+            candidate = {"id": data_id, "sig": sig, "ts": ts}
+            if data_id == article_id:
+                return candidate
+            if best is None:
+                best = candidate
+        if best:
+            return best
+
         patterns = [
-            r'data-n-a-id=["\']([^"\']+)["\'][^>]*data-n-a-sg=["\']([^"\']+)["\'][^>]*data-n-a-ts=["\']([^"\']+)',
-            r'data-n-a-sg=["\']([^"\']+)["\'][^>]*data-n-a-ts=["\']([^"\']+)',
+            r'data-n-a-id=["\']([^"\']+)["\'][^>]*'
+            r'data-n-a-sg=["\']([^"\']+)["\'][^>]*'
+            r'data-n-a-ts=["\']([^"\']+)',
+            r'data-n-a-sg=["\']([^"\']+)["\'][^>]*'
+            r'data-n-a-ts=["\']([^"\']+)',
         ]
         for i, pat in enumerate(patterns):
-            m = re.search(pat, html, re.I | re.S)
+            m = re.search(pat, html or "", re.I | re.S)
             if m:
                 if i == 0:
                     return {"id": m.group(1), "sig": m.group(2), "ts": m.group(3)}
@@ -346,6 +391,7 @@ class GoogleNewsResolver:
 
     @classmethod
     def _legacy_extract(cls, value: str) -> str | None:
+        """Conservative compatibility fallback for older embedded URLs."""
         seen: set[str] = set()
         queue = [value]
         for _ in range(8):
@@ -379,52 +425,95 @@ class GoogleNewsResolver:
 
     @staticmethod
     def _rpc_payload(params: list[dict[str, str]]) -> str:
+        """Build the current Fbv4je/garturlreq payload.
+
+        The X placeholders are intentional; this is the request shape used by
+        current community implementations. The old resolver used a different
+        first nested array, which is more brittle against Google's changes.
+        """
         requests = []
         for p in params:
-            art = json.dumps([
-                "garturlreq",
-                [[
-                    ["en-US", "US", ["FINANCE_TOP_INDICES", "WEB_TEST_1_0"], None, None, 1, 1, "US:en", None, 1, None, None, None, None, None, 0, 1],
+            art = json.dumps(
+                [
+                    "garturlreq",
+                    [
+                        [
+                            "X", "X", ["X", "X"], None, None, 1, 1,
+                            "US:en", None, 1, None, None, None, None,
+                            None, 0, 1,
+                        ],
+                        "X", "X", 1, [1, 1, 1], 1, 1, None, 0, 0, None, 0,
+                    ],
                     p["id"], int(float(p["ts"])), p["sig"],
-                ]],
-            ], separators=(",", ":"))
+                ],
+                separators=(",", ":"),
+            )
             requests.append(["Fbv4je", art, None, "generic"])
         return urlencode({"f.req": json.dumps([requests], separators=(",", ":"))})
 
     @classmethod
     def _urls_from_rpc(cls, text: str) -> list[str]:
+        """Parse the batchexecute response.
+
+        First try the exact garturlres field. Only then use a strict recursive
+        URL scan as a compatibility fallback.
+        """
         candidates: list[str] = []
-        fragments = [text]
-        if "\n\n" in text:
-            fragments.append(text.split("\n\n", 1)[1])
-        for fragment in fragments:
+
+        # Exact garturlres extraction. Google wraps the response in an
+        # anti-XSSI prefix/newline and nested JSON.
+        marker = '\\"garturlres\\",\\"'
+        pos = text.find(marker)
+        if pos >= 0:
+            start = pos + len(marker)
+            end = text.find('\\",', start)
+            if end > start:
+                raw = text[start:end]
+                raw = raw.replace("\\u003d", "=").replace("\\u0026", "&").replace("\\/", "/")
+                raw = unquote(raw)
+                if cls._valid_destination(raw):
+                    candidates.append(raw)
+
+        # JSON-aware parsing for current/variant response wrappers.
+        for fragment in (text, text.split("\n\n", 1)[1] if "\n\n" in text else ""):
+            if not fragment:
+                continue
             try:
                 obj = json.loads(fragment)
             except Exception:
                 continue
-            stack = [obj]
-            while stack:
-                cur = stack.pop()
-                if isinstance(cur, str):
-                    if "http" in cur:
-                        for m in re.finditer(r"https?://[^\s\"'<>\\]+", cur):
-                            u = unquote(m.group(0)).replace("\\u003d", "=").replace("\\u0026", "&").rstrip(".,)]}")
+
+            def walk(x):
+                if isinstance(x, list):
+                    for v in x:
+                        walk(v)
+                elif isinstance(x, dict):
+                    for k, v in x.items():
+                        if k == "garturlres" and isinstance(v, str):
+                            u = unquote(v).replace("\\u003d", "=").replace("\\u0026", "&")
                             if cls._valid_destination(u):
                                 candidates.append(u)
-                    if cur.startswith(("[", "{")):
+                        walk(v)
+                elif isinstance(x, str):
+                    # Do not inspect XML namespaces or arbitrary HTML as a
+                    # source of publisher URLs. Only explicit URL strings that
+                    # pass the strict destination gate are accepted.
+                    if x.startswith(("http://", "https://")) and cls._valid_destination(x):
+                        candidates.append(x)
+                    if x.startswith(("[", "{")):
                         try:
-                            stack.append(json.loads(cur))
+                            walk(json.loads(x))
                         except Exception:
                             pass
-                elif isinstance(cur, list):
-                    stack.extend(cur)
-                elif isinstance(cur, dict):
-                    stack.extend(cur.values())
+
+            walk(obj)
+
         return list(dict.fromkeys(candidates))
 
     async def _fetch_params(self, article_id: str) -> dict[str, str]:
         client = await self.client()
         last = "params-unavailable"
+
         async with self._page_sem:
             for target in (
                 f"https://news.google.com/rss/articles/{article_id}",
@@ -432,48 +521,59 @@ class GoogleNewsResolver:
             ):
                 for attempt in range(MAX_RETRIES + 1):
                     try:
-                        r = await client.get(target)
-                        if r.status_code == 429:
+                        response = await client.get(target)
+                        if response.status_code == 429:
                             last = "google-429"
-                        elif r.status_code == 200:
-                            params = self._extract_params(r.text, article_id)
+                        elif response.status_code == 200:
+                            params = self._extract_params(response.text, article_id)
                             if params:
                                 return params
-                            legacy = self._legacy_extract(r.text)
+                            legacy = self._legacy_extract(response.text)
                             if legacy:
                                 return {"legacy_url": legacy}
                             last = "signature-not-found"
                         else:
-                            last = f"google-http-{r.status_code}"
+                            last = f"google-http-{response.status_code}"
                     except Exception as exc:
                         last = f"params-{type(exc).__name__}"
+
                     if attempt < MAX_RETRIES:
-                        await asyncio.sleep(0.4 * (attempt + 1))
+                        await asyncio.sleep(0.35 * (attempt + 1) + random.random() * 0.2)
         raise RuntimeError(last)
 
     async def _rpc_decode(self, params: dict[str, str]) -> str:
         client = await self.client()
         async with self._rpc_sem:
-            wait = RPC_MIN_INTERVAL - (time.monotonic() - self._last_rpc_at)
-            if wait > 0:
-                await asyncio.sleep(wait)
             for attempt in range(MAX_RETRIES + 1):
+                wait = RPC_MIN_INTERVAL - (time.monotonic() - self._last_rpc_at)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+
                 try:
                     self._last_rpc_at = time.monotonic()
-                    response = await client.post(BATCH_ENDPOINT, content=self._rpc_payload([params]), headers=_RPC_HEADERS)
+                    response = await client.post(
+                        BATCH_ENDPOINT,
+                        content=self._rpc_payload([params]),
+                        headers=_RPC_HEADERS,
+                    )
+
                     if response.status_code == 429:
                         raise RuntimeError("google-rpc-429")
                     if response.status_code >= 500:
                         raise RuntimeError(f"google-rpc-http-{response.status_code}")
                     response.raise_for_status()
+
                     urls = self._urls_from_rpc(response.text)
                     if urls:
                         return urls[0]
                     raise RuntimeError("google-rpc-empty")
-                except Exception:
+                except Exception as exc:
                     if attempt >= MAX_RETRIES:
                         raise
-                    await asyncio.sleep(0.8 * (attempt + 1))
+                    # 429 deserves a longer pause than a transient 5xx.
+                    delay = (1.0 + attempt * 1.5) if "429" in str(exc) else (0.5 + attempt * 0.7)
+                    await asyncio.sleep(delay + random.random() * 0.5)
+
         raise RuntimeError("google-rpc-failed")
 
     async def _resolve_http(self, url: str) -> ResolveResult:
@@ -484,150 +584,78 @@ class GoogleNewsResolver:
             params = await self._fetch_params(article_id)
             if params.get("legacy_url") and self._valid_destination(params["legacy_url"]):
                 return ResolveResult(params["legacy_url"], "legacy-embedded")
+
             destination = await self._rpc_decode(params)
             if self._valid_destination(destination):
                 return ResolveResult(destination, "batchexecute")
-            return ResolveResult(url, "failed", "google-rpc-no-publisher-url")
+
+            return ResolveResult(url, "failed", "google-rpc-destination-rejected")
         except Exception as exc:
-            return ResolveResult(url, "failed", str(exc)[:200])
+            return ResolveResult(url, "failed", str(exc)[:240])
 
-    # ------------------------------------------------------------------
-    # Independent browser resolver
-    # ------------------------------------------------------------------
-    @classmethod
-    async def _page_candidates(cls, page, source_url: str) -> list[str]:
-        """Collect publisher candidates without trusting a single DOM field."""
-        candidates: list[tuple[str, int]] = []
-        final_url = page.url
-        if cls._valid_destination(final_url):
-            candidates.append((final_url, 100))
+    async def _browser_resolve(self, url: str) -> ResolveResult:
+        """Last-resort browser resolver.
 
-        try:
-            values = await page.evaluate("""
-            () => {
-              const out=[];
-              const add=(v,score)=>{if(v) out.push([v,score]);};
-              const canon=document.querySelector('link[rel="canonical"]');
-              if(canon?.href) add(canon.href,95);
-              const og=document.querySelector('meta[property="og:url"]');
-              if(og?.content) add(og.content,90);
-              document.querySelectorAll('script[type="application/ld+json"]').forEach(s=>{
-                try{
-                  const walk=x=>{
-                    if(!x)return;
-                    if(Array.isArray(x)){x.forEach(walk);return;}
-                    if(typeof x==='object'){
-                      if(typeof x.url==='string') add(x.url,88);
-                      Object.values(x).forEach(walk);
-                    }
-                  };
-                  walk(JSON.parse(s.textContent||''));
-                }catch{}
-              });
-              document.querySelectorAll('a[href]').forEach(a=>{
-                const h=a.href||'';
-                if(/^https?:/i.test(h)) add(h,60);
-              });
-              return out;
-            }
-            """)
-            candidates.extend(values)
-        except Exception:
-            pass
-
-        clean: dict[str, int] = {}
-        for raw, score in candidates:
-            u = cls._normalize_candidate(raw, source_url)
-            if not u:
-                continue
-            host = (urlparse(u).hostname or "").lower()
-            # Prefer article-like URLs over generic publisher homepages.
-            path = urlparse(u).path.lower()
-            bonus = 0
-            if len(path.strip("/")) > 12:
-                bonus += 8
-            if any(x in path for x in ("/article", "/news/", "/story/", "/stories/", "/world/", "/business/", "/technology/")):
-                bonus += 10
-            if host in {"facebook.com", "x.com", "twitter.com", "youtube.com", "instagram.com", "linkedin.com"}:
-                bonus -= 50
-            clean[u] = max(clean.get(u, -999), int(score) + bonus)
-
-        return [u for u, _ in sorted(clean.items(), key=lambda kv: kv[1], reverse=True)]
-
-    async def _resolve_browser(self, url: str) -> ResolveResult:
-        """Resolve a Google News URL using a completely independent browser.
-
-        The browser is deliberately independent from the publisher scraper:
-        no publisher routes, cookie jar, tracker filters, or HTTP session are
-        reused.  We open the exact Google URL, allow client-side navigation to
-        settle, then inspect navigation + structured metadata + links.  If the
-        page presents a normal public article link without navigating itself,
-        we follow the best candidate once in the same browser and use the
-        resulting URL as the publisher destination.
+        Browser resolution is deliberately NOT allowed to accept arbitrary
+        external URLs from the Google page. It only accepts canonical/OG/
+        JSON-LD/article-anchor candidates that pass the strict destination gate.
         """
-        await self.start()
-        if not self._browser_context:
-            return ResolveResult(url, "browser-failed", "google-browser-not-ready")
-
-        async with self._browser_sem:
-            page = await self._browser_context.new_page()
-            page.set_default_navigation_timeout(0)
-            page.set_default_timeout(0)
+        context = await self._get_browser()
+        async with self._browser_page_sem:
+            page = await context.new_page()
             try:
-                # Exact original URL.  Do not add query parameters or rewrite
-                # the Google News token before browser navigation.
-                await page.goto(url, wait_until="domcontentloaded", timeout=0)
-                await page.wait_for_timeout(BROWSER_SETTLE_MS)
-
-                candidates = await self._page_candidates(page, url)
-                for candidate in candidates:
-                    if self._valid_destination(candidate):
-                        logger.info("Google browser resolved %s -> %s", url, candidate)
-                        return ResolveResult(candidate, "browser")
-
-                # Some Google News pages expose the publisher only as a normal
-                # article anchor after client-side rendering. Follow the best
-                # external candidate once. This is navigation, not an RPC call.
-                if candidates:
-                    target = candidates[0]
-                    try:
-                        await page.goto(target, wait_until="domcontentloaded", timeout=0)
-                        await page.wait_for_timeout(BROWSER_SECOND_SETTLE_MS)
-                        final = page.url
-                        if self._valid_destination(final):
-                            logger.info("Google browser followed publisher %s -> %s", target, final)
-                            return ResolveResult(final, "browser-follow")
-                    except Exception as exc:
-                        logger.debug("Google browser candidate follow failed: %s", exc)
-
-                # One final DOM inspection catches delayed navigation/metadata.
-                candidates = await self._page_candidates(page, url)
-                for candidate in candidates:
-                    if self._valid_destination(candidate):
-                        logger.info("Google browser resolved on final inspection %s -> %s", url, candidate)
-                        return ResolveResult(candidate, "browser")
-
-                title = ""
-                try:
-                    title = (await page.title()).strip()[:120]
-                except Exception:
-                    pass
-                return ResolveResult(
+                page.set_default_navigation_timeout(BROWSER_NAV_TIMEOUT_MS)
+                page.set_default_timeout(2500)
+                await page.goto(
                     url,
-                    "browser-failed",
-                    f"publisher-url-not-found{': ' + title if title else ''}",
+                    wait_until="domcontentloaded",
+                    timeout=BROWSER_NAV_TIMEOUT_MS,
                 )
+
+                for _ in range(BROWSER_POLLS):
+                    current = page.url
+                    if current != url and self._valid_destination(current):
+                        return ResolveResult(current, "browser")
+
+                    html = await page.content()
+                    candidates = self._browser_candidates(html, current)
+                    if candidates:
+                        # Only return a high-confidence browser candidate.
+                        # Do not use a generic homepage as a false positive.
+                        best = candidates[0]
+                        if self._article_like_score(best) >= 8:
+                            return ResolveResult(best, "browser")
+
+                    await asyncio.sleep(BROWSER_POLL_MS / 1000.0)
+
+                return ResolveResult(url, "browser-failed", "publisher-url-not-observed")
             except Exception as exc:
-                return ResolveResult(url, "browser-failed", f"{type(exc).__name__}: {exc}"[:300])
+                return ResolveResult(url, "browser-failed", f"{type(exc).__name__}: {exc}"[:240])
             finally:
                 try:
                     await page.close()
                 except Exception:
                     pass
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    def _cache_get(self, key: str) -> ResolveResult | None:
+        item = self._cache.get(key)
+        if not item:
+            return None
+        expires, result = item
+        if expires <= time.monotonic():
+            self._cache.pop(key, None)
+            return None
+        self._cache.move_to_end(key)
+        return ResolveResult(result.url, "failed" if result.method == "failed" else "cache", result.error)
+
+    def _cache_put(self, key: str, result: ResolveResult, ttl: float = CACHE_TTL) -> None:
+        if ttl <= 0:
+            return
+        self._cache[key] = (time.monotonic() + ttl, result)
+        self._cache.move_to_end(key)
+        while len(self._cache) > CACHE_MAX:
+            self._cache.popitem(last=False)
+
     async def resolve(self, url: str) -> ResolveResult:
         url = str(url).strip()
         if not self.is_google_url(url):
@@ -637,14 +665,14 @@ class GoogleNewsResolver:
         if cached:
             return cached
 
-        # Coalesce concurrent requests for the same URL onto one resolution.
         existing = self._inflight.get(url)
         if existing is not None:
             return await existing
 
-        loop = asyncio.get_event_loop()
-        future: asyncio.Future = loop.create_future()
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
         self._inflight[url] = future
+
         try:
             result = await self._resolve_uncached(url)
             if not future.done():
@@ -658,36 +686,30 @@ class GoogleNewsResolver:
             self._inflight.pop(url, None)
 
     async def _resolve_uncached(self, url: str) -> ResolveResult:
-        # Browser-first is intentional. Google frequently rate-limits the
-        # internal batchexecute RPC. The independent Chromium path does not
-        # depend on that RPC and opens the exact user-supplied Google URL.
-        browser_result = await self._resolve_browser(url)
-        if self._valid_destination(browser_result.url):
-            self._cache_put(url, browser_result)
-            return browser_result
-
-        # Only after the browser has failed do we spend an RPC attempt. This
-        # keeps the normal path independent of Google's internal endpoint and
-        # prevents a 429 from becoming the sole source of truth.
+        # IMPORTANT: the authoritative path is the garturl RPC. Browser is a
+        # fallback only. This prevents Google page assets/namespaces from being
+        # mistaken for publisher URLs.
         http_result = await self._resolve_http(url)
-        if http_result.method not in ("failed", "invalid-google-url") and self._valid_destination(http_result.url):
+        if (
+            http_result.method not in ("failed", "invalid-google-url")
+            and self._valid_destination(http_result.url)
+        ):
             self._cache_put(url, http_result)
             return http_result
 
-        # Negative-cache the failure briefly (see NEGATIVE_TTL) so a burst of
-        # duplicate requests for the same still-failing URL — which the
-        # in-flight coalescing above only catches while the FIRST attempt is
-        # still running — doesn't each re-pay the full browser+RPC cost the
-        # moment that first attempt finishes and clears from _inflight.
-        detail = "; ".join(x for x in [browser_result.error, http_result.error] if x)
+        browser_result = await self._browser_resolve(url)
+        if self._valid_destination(browser_result.url) and browser_result.method.startswith("browser"):
+            self._cache_put(url, browser_result)
+            return browser_result
+
+        detail = "; ".join(
+            x for x in [http_result.error, browser_result.error] if x
+        )
         result = ResolveResult(url, "failed", detail[:300] or "google-url-unresolved")
         self._cache_put(url, result, ttl=NEGATIVE_TTL)
         return result
 
     async def resolve_many(self, urls: list[str]) -> list[ResolveResult]:
-        # Keep association exact. The browser fallback itself is serialized so
-        # multiple simultaneous Google tabs cannot create a burst of Chromium
-        # sessions against Google.
         sem = asyncio.Semaphore(PAGE_CONCURRENCY)
 
         async def one(u: str):
